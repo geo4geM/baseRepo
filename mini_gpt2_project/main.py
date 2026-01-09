@@ -145,7 +145,7 @@ def train_gpt2_on_books(
     device: torch.device,
     paths: Dict[str, Path],
     max_steps: int = 2000,     # <--- Fixed step count
-    batch_size: int = 16,      # <--- Quadruple (if you used 4 before), adjust up as RAM/gpu allows
+    batch_size: int = 32,      # <--- Quadruple (if you used 4 before), adjust up as RAM/gpu allows
 ) -> Tuple[Path, nn.Module]:
     """Fine-tune GPT2 on book texts using language modeling objective with a fixed number of steps."""
     print("\n" + "="*60 + "\nPHASE 0: FINE-TUNING GPT2 ON BOOK TEXTS\n" + "="*60)
@@ -426,7 +426,7 @@ def main():
             device=device,
             paths=paths,
             max_steps=1000,         # <--- number of gradient steps to train for (ex: 2000, adjust as needed)
-            batch_size=16,           # <--- large, since you have plenty of memory
+            batch_size=32,           # <--- large, since you have plenty of memory
         )
 
     # Create wrapper with the trained/loaded model and LM head
