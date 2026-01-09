@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict, Mapping
 
+import torch
+
 
 @dataclass
 class ModelConfig:
@@ -25,11 +27,11 @@ class ModelConfig:
         num_classes: Number of output classes for classification.
     """
 
-    vocab_size: int = 50257
-    n_embd: int = 384
-    n_layer: int = 6
-    n_head: int = 6
-    max_seq_len: int = 512
+    vocab_size: int = 256
+    n_embd: int = 768
+    n_layer: int = 4
+    n_head: int = 12
+    max_seq_len: int = 1024
     num_classes: int = 2
 
     @classmethod
@@ -58,4 +60,52 @@ class ModelConfig:
             A dictionary representation of the configuration.
         """
         return asdict(self)
+
+
+@dataclass
+class InferenceConfig:
+    """Configuration for inference-time behavior.
+
+    Attributes:
+        chunk_size: Maximum sequence chunk size processed at once.
+        damping: Stabilization factor for iterative or streaming decoding.
+    """
+
+    chunk_size: int = 1024
+    damping: float = 0.1
+
+
+def get_device() -> torch.device:
+    """Get the default torch device for model execution.
+
+    Returns:
+        A CUDA device when available, otherwise the CPU device.
+    """
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def get_dtype() -> torch.dtype:
+    """Get the default floating point data type for model parameters.
+
+    Returns:
+        The torch floating point dtype used for model weights and activations.
+    """
+    return torch.float32
+
+
+def get_config_by_name(name: str) -> ModelConfig:
+    """Retrieve a predefined `ModelConfig` instance by name.
+
+    The name argument is currently ignored and a default `ModelConfig` is
+    returned. This function exists to match the senior API and can be
+    extended later to support multiple named configurations.
+
+    Args:
+        name: Identifier for a particular configuration preset.
+
+    Returns:
+        A default `ModelConfig` instance.
+    """
+    _ = name
+    return ModelConfig()
 
