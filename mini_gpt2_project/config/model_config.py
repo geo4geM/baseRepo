@@ -35,7 +35,7 @@ class ModelConfig:
     num_classes: int = 2
 
     # --- Add this field below (for tokenizer control) ---
-    tokenizer_type: str = "byte"  # "byte" or "bpe"
+    tokenizer_type: str = "bhe"  # "byte" or "bpe"
     # For advanced usage, you might also add paths for BPE vocab/merges if needed:
     # bpe_vocab_path: Optional[str] = None
     # bpe_merges_path: Optional[str] = None
