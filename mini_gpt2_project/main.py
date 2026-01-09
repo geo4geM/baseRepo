@@ -171,7 +171,7 @@ def train_gpt2_on_books(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=6,
+        num_workers=32,
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.1)  # high regularization
