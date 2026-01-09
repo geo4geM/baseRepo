@@ -28,9 +28,9 @@ class ModelConfig:
     """
 
     vocab_size: int = 256
-    n_embd: int = 768
+    n_embd: int = 704
     n_layer: int = 4
-    n_head: int = 12
+    n_head: int = 11
     max_seq_len: int = 1024
     num_classes: int = 2
 
