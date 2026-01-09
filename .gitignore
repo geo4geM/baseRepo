@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+.cursorrules
+
+# Project Specific
+Dataset/
+*.pdf
+models/
+checkpoints/
+results/
+wandb/

@@ -1,0 +1,2 @@
+"""Requirements file listing project dependencies for the Mini-GPT2 project."""
+
