@@ -14,10 +14,16 @@ def install_dependencies():
 def run_kaggle_pipeline():
     print("Starting Kaggle Pipeline...")
     install_dependencies()
-    
-    # Setup paths
-    sys.path.insert(0, str(Path(__file__).parent))
-    from main import main
+
+    # Setup paths so `mini_gpt2_project` is imported as a proper package.
+    # We add the *parent* of this directory to sys.path and then import
+    # `mini_gpt2_project.main`. This ensures that relative imports such as
+    # `from ..config.model_config import ...` inside submodules work correctly.
+    project_root = Path(__file__).parent  # .../mini_gpt2_project
+    repo_root = project_root.parent       # repository root
+    sys.path.insert(0, str(repo_root))
+
+    from mini_gpt2_project.main import main
     
     # Trigger main execution
     main()
