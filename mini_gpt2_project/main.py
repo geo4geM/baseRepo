@@ -425,7 +425,7 @@ def main():
             model_config=model_config,
             device=device,
             paths=paths,
-            max_steps=2000,         # <--- number of gradient steps to train for (ex: 2000, adjust as needed)
+            max_steps=1000,         # <--- number of gradient steps to train for (ex: 2000, adjust as needed)
             batch_size=16,           # <--- large, since you have plenty of memory
         )
 
