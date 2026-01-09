@@ -11,6 +11,26 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
 
+class BaseTokenizer:
+    """
+    Abstract tokenizer interface for modular tokenization.
+    All tokenizers should inherit from this.
+    """
+    def encode(self, text: str):
+        """Encode text to a list of tokens (integers)."""
+        raise NotImplementedError("encode() must be implemented by subclass.")
+
+    def decode(self, tokens):
+        """Decode a list of tokens to a string."""
+        raise NotImplementedError("decode() must be implemented by subclass.")
+
+    def chunk_text(self, text: str, chunk_size: int):
+        """
+        Optional: Chunk text into multiple segments of length <= chunk_size.
+        Returns a list of token lists.
+        """
+        raise NotImplementedError("chunk_text() must be implemented by subclass.")
+
 
 class DataLoader:
     """Load and manage dataset for BDH Track B."""
@@ -123,31 +143,81 @@ class DataLoader:
         return examples
 
 
-class ByteTokenizer:
-    """Simple byte-level tokenizer for BDH (vocab_size=256)."""
-    
+class ByteTokenizer(BaseTokenizer):
+    """
+    Simple byte-level tokenizer.
+    Each byte in UTF-8 is a token in [0, 255].
+    """
     def __init__(self):
         self.vocab_size = 256
-    
-    def encode(self, text: str) -> List[int]:
-        """Convert text to byte tokens."""
+
+    def encode(self, text: str):
         return list(text.encode('utf-8'))
-    
-    def decode(self, tokens: List[int]) -> str:
-        """Convert byte tokens back to text."""
+
+    def decode(self, tokens):
         return bytes(tokens).decode('utf-8', errors='replace')
-    
-    def chunk_text(self, text: str, chunk_size: int) -> List[List[int]]:
-        """Split text into chunks of byte tokens."""
+
+    def chunk_text(self, text: str, chunk_size: int):
         tokens = self.encode(text)
-        chunks = []
-        
-        for i in range(0, len(tokens), chunk_size):
-            chunk = tokens[i:i + chunk_size]
-            if chunk:  # Skip empty chunks
-                chunks.append(chunk)
-        
-        return chunks
+        return [tokens[i:i + chunk_size] for i in range(0, len(tokens), chunk_size)]
+
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, normalizers
+
+
+
+class BPETokenizer(BaseTokenizer):
+    """
+    Byte Pair Encoding tokenizer using HuggingFace tokenizers.
+    You can train it on your corpus or load pretrained vocab/merges.
+    """
+    def __init__(self, vocab_path=None, merges_path=None, training_files=None, vocab_size=8000):
+        if vocab_path and merges_path:
+            # Load pre-existing BPE model
+            self.tokenizer = Tokenizer(models.BPE.from_file(vocab_path, merges_path))
+        elif training_files is not None:
+            # Train new BPE model
+            self.tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+            self.tokenizer.normalizer = normalizers.Sequence([normalizers.NFD(), normalizers.Lowercase()])
+            self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
+            self.tokenizer.decoder = decoders.ByteLevel()
+            trainer = trainers.BpeTrainer(vocab_size=vocab_size, show_progress=True, initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+            self.tokenizer.train(training_files, trainer)
+        else:
+            raise ValueError("Must provide either vocab/merges files or training files to BPETokenizer.")
+
+        self.vocab_size = self.tokenizer.get_vocab_size()
+
+    def encode(self, text: str):
+        return self.tokenizer.encode(text).ids
+
+    def decode(self, tokens):
+        return self.tokenizer.decode(tokens)
+
+    def chunk_text(self, text: str, chunk_size: int):
+        tokens = self.encode(text)
+        return [tokens[i:i + chunk_size] for i in range(0, len(tokens), chunk_size)]
+
+
+
+def get_tokenizer(config):
+    """
+    Factory function to select between ByteTokenizer and BPETokenizer
+    based on config.tokenizer_type.
+    """
+    if getattr(config, "tokenizer_type", "byte") == "byte":
+        return ByteTokenizer()
+    elif getattr(config, "tokenizer_type", "byte") == "bpe":
+        # You can also enhance this to read vocab/merges path or training_files from config as needed!
+        return BPETokenizer(
+            vocab_path=getattr(config, "bpe_vocab_path", None),
+            merges_path=getattr(config, "bpe_merges_path", None),
+            training_files=getattr(config, "bpe_training_files", None),
+            vocab_size=getattr(config, "bpe_vocab_size", 8000),
+        )
+    else:
+        raise ValueError(f"Unknown tokenizer_type: {getattr(config, 'tokenizer_type', None)}")
+
+
 
 
 def stream_book_chunks(book_path: Path, chunk_size: int = 2048) -> List[List[int]]:

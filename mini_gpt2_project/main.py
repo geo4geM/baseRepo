@@ -24,6 +24,8 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
+from mini_gpt2_project.utils.data_loader import get_tokenizer
+
 # Add project to path (for local execution)
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -164,7 +166,7 @@ def train_gpt2_on_books(
     print("\n" + "="*60 + "\nPHASE 0: FINE-TUNING GPT2 ON BOOK TEXTS\n" + "="*60)
     
     # Collect all book texts and tokenize
-    tokenizer = ByteTokenizer()
+    tokenizer = get_tokenizer(model_config)
     all_chunks: List[List[int]] = []
     
     print("Loading and tokenizing book texts...")
@@ -387,7 +389,7 @@ def evaluate_on_train_csv(
     print("\n" + "="*60 + "\nEVALUATING ON TRAIN.CSV\n" + "="*60)
     
     model.eval()
-    tokenizer = ByteTokenizer()
+    tokenizer = get_tokenizer(model_config)
     
     train_examples = loader.get_train_examples()
     predictions = []

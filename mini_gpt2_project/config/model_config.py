@@ -34,6 +34,13 @@ class ModelConfig:
     max_seq_len: int = 1024
     num_classes: int = 2
 
+    # --- Add this field below (for tokenizer control) ---
+    tokenizer_type: str = "byte"  # "byte" or "bpe"
+    # For advanced usage, you might also add paths for BPE vocab/merges if needed:
+    # bpe_vocab_path: Optional[str] = None
+    # bpe_merges_path: Optional[str] = None
+    # bpe_training_files: Optional[List[str]] = None
+
     @classmethod
     def from_dict(cls, config_dict: Mapping[str, Any]) -> "ModelConfig":
         """Create a `ModelConfig` instance from a configuration mapping.

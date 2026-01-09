@@ -13,6 +13,8 @@ from ..config.model_config import InferenceConfig, ModelConfig
 from ..model.mini_gpt2 import MiniGPT2
 from ..utils.data_loader import ByteTokenizer
 
+from mini_gpt2_project.utils.data_loader import get_tokenizer
+
 
 class MiniGPT2Wrapper:
     """Wrapper around `MiniGPT2` for novel-level reasoning and analysis.
@@ -29,6 +31,7 @@ class MiniGPT2Wrapper:
         inference_config: InferenceConfig,
         device: torch.device,
         model: Optional[MiniGPT2] = None,
+        lm_head: Optional[torch.nn.Module] = None,
     ) -> None:
         """Initialize the MiniGPT2Wrapper.
 
@@ -38,7 +41,10 @@ class MiniGPT2Wrapper:
                 as chunk size and damping.
             device: Torch device on which the model will be placed.
             model: Optional pre-trained MiniGPT2 model. If None, creates a new one.
+            lm_head: Optional language modeling head for loss computation.
+                If None, a new untrained head will be created (loss may be inaccurate).
         """
+        self.model_config = model_config
         if model is not None:
             self.model = model.to(device)
         else:
@@ -47,8 +53,18 @@ class MiniGPT2Wrapper:
 
         self.inference_config = inference_config
         self.device = device
+        from ..utils.data_loader import get_tokenizer
+        self.tokenizer = get_tokenizer(self.model_config)
 
-        self.tokenizer = ByteTokenizer()
+        # LM head handling for loss computation
+        if lm_head is not None:
+            self.lm_head = lm_head.to(device)
+            self.lm_head.eval()
+        else:
+            vocab_size = self.model.gpt.config.vocab_size
+            n_embd = self.model.gpt.config.n_embd
+            self.lm_head = torch.nn.Linear(n_embd, vocab_size).to(device)
+            self.lm_head.eval()
 
     def _compute_mean_hidden_state_from_tokens(
         self,
@@ -181,67 +197,60 @@ class MiniGPT2Wrapper:
             The language modeling loss as a Python float (surprisal score).
         """
         self.model.eval()
-        tokenizer = ByteTokenizer()
-        
+        tokenizer = self.tokenizer
+
         # Tokenize text
         tokens = tokenizer.encode(text)
         chunk_size = self.inference_config.chunk_size
-        
+
         # Split into chunks if needed
         if len(tokens) > chunk_size:
             token_chunks = tokenizer.chunk_text(text, chunk_size)
         else:
             token_chunks = [tokens]
-        
+
         total_loss = 0.0
         total_tokens = 0
-        
-        # Create a temporary LM head for loss computation
-        # (This matches the training setup)
-        vocab_size = self.model.gpt.config.vocab_size
-        n_embd = self.model.gpt.config.n_embd
-        lm_head = torch.nn.Linear(n_embd, vocab_size).to(self.device)
-        
-        # We need to load the LM head from checkpoint or recreate it
-        # For now, we'll create it and note that it should match training
+
+        # Use the (trained) LM head stored in self.lm_head
         criterion = torch.nn.CrossEntropyLoss(ignore_index=0)
-        
+
         with torch.no_grad():
             for chunk in token_chunks:
                 if not chunk:
                     continue
-                
+
                 # Prepare input
                 if len(chunk) > chunk_size:
                     chunk = chunk[:chunk_size]
                 else:
                     chunk = chunk + [0] * (chunk_size - len(chunk))
-                
+
                 input_ids = torch.tensor([chunk], dtype=torch.long, device=self.device)
                 attention_mask = (input_ids != 0).long().to(self.device)
                 labels = input_ids.clone()
-                
+
                 # Forward pass
                 outputs = self.model.gpt(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                 )
                 hidden_states = outputs.last_hidden_state  # (1, T, H)
-                
-                # Apply LM head
-                logits = lm_head(hidden_states)  # (1, T, vocab_size)
-                
+
+                # Apply LM head (use stored trained head)
+                logits = self.lm_head(hidden_states)  # (1, T, vocab_size)
+
                 # Compute loss
                 logits_flat = logits.view(-1, logits.size(-1))
                 labels_flat = labels.view(-1)
                 loss = criterion(logits_flat, labels_flat)
-                
+
                 # Accumulate (weighted by number of non-padding tokens)
                 num_tokens = attention_mask.sum().item()
                 if num_tokens > 0:
                     total_loss += loss.item() * num_tokens
                     total_tokens += num_tokens
-        
+
         # Return average loss per token
         avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
         return float(avg_loss)
