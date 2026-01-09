@@ -144,10 +144,10 @@ def train_gpt2_on_books(
     model_config: ModelConfig,
     device: torch.device,
     paths: Dict[str, Path],
-    target_minutes: float = 30.0,
-    checkpoint_interval_minutes: float = 5.0,
+    max_epochs: int = 100,
+    patience: int = 3,
 ) -> Path:
-    """Fine-tune GPT2 on book texts using language modeling objective.
+    """Fine-tune GPT2 on book texts using language modeling objective with early stopping.
     
     Args:
         model: The MiniGPT2 model to train.
@@ -155,11 +155,11 @@ def train_gpt2_on_books(
         model_config: Model configuration.
         device: Torch device.
         paths: Dictionary of output paths.
-        target_minutes: Target training time in minutes.
-        checkpoint_interval_minutes: Interval between checkpoints in minutes.
+        max_epochs: Maximum number of training epochs.
+        patience: Number of epochs to wait for validation loss improvement before stopping.
         
     Returns:
-        Path to the final trained model checkpoint.
+        Path to the best trained model checkpoint (lowest validation loss).
     """
     print("\n" + "="*60 + "\nPHASE 0: FINE-TUNING GPT2 ON BOOK TEXTS\n" + "="*60)
     
@@ -179,49 +179,58 @@ def train_gpt2_on_books(
     
     print(f"\nTotal chunks: {len(all_chunks)}")
     
-    # Create dataset and dataloader
-    dataset = BookTextDataset(all_chunks, max_seq_len=model_config.max_seq_len)
+    # Split into 90% training and 10% validation
+    split_idx = int(len(all_chunks) * 0.9)
+    train_chunks = all_chunks[:split_idx]
+    val_chunks = all_chunks[split_idx:]
+    
+    print(f"Split: {len(train_chunks)} training chunks, {len(val_chunks)} validation chunks")
+    
+    # Create datasets and dataloaders
+    train_dataset = BookTextDataset(train_chunks, max_seq_len=model_config.max_seq_len)
+    val_dataset = BookTextDataset(val_chunks, max_seq_len=model_config.max_seq_len)
+    
     train_loader = TorchDataLoader(
-        dataset,
-        batch_size=4,  # Small batch size for memory efficiency
+        train_dataset,
+        batch_size=4,
         shuffle=True,
+        num_workers=0,
+    )
+    val_loader = TorchDataLoader(
+        val_dataset,
+        batch_size=4,
+        shuffle=False,
         num_workers=0,
     )
     
     # Setup optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
     
-    # Language modeling loss (we'll use the GPT2's built-in LM head)
-    # Since we're using GPT2Model (not GPT2LMHeadModel), we need to add LM head
+    # Language modeling head and loss
     lm_head = nn.Linear(model_config.n_embd, model_config.vocab_size).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding tokens
     
-    model.train()
-    lm_head.train()
+    # Early stopping variables
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    best_lm_head_state = None
+    best_optimizer_state = None
+    best_epoch = 0
     
-    # Training loop with time-based stopping
-    start_time = time.time()
-    target_seconds = target_minutes * 60
-    checkpoint_interval_seconds = checkpoint_interval_minutes * 60
-    next_checkpoint_time = start_time + checkpoint_interval_seconds
+    print(f"\nStarting training (max_epochs={max_epochs}, patience={patience})...")
+    print("Early stopping will trigger if validation loss doesn't improve for 3 consecutive epochs")
     
-    step = 0
-    total_loss = 0.0
-    losses = []
-    
-    print(f"\nStarting training (target: {target_minutes} minutes)...")
-    print(f"Checkpoints will be saved every {checkpoint_interval_minutes} minutes")
-    
-    pbar = tqdm(desc="Training", unit="step")
-    
-    while (time.time() - start_time) < target_seconds:
-        for batch in train_loader:
-            current_time = time.time()
-            elapsed_minutes = (current_time - start_time) / 60
-            
-            if (current_time - start_time) >= target_seconds:
-                break
-            
+    # Training loop with epoch-based early stopping
+    for epoch in range(max_epochs):
+        # Training phase
+        model.train()
+        lm_head.train()
+        train_loss = 0.0
+        train_steps = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{max_epochs} [Train]")
+        for batch in pbar:
             # Move batch to device
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
@@ -250,34 +259,83 @@ def train_gpt2_on_books(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            step += 1
-            total_loss += loss.item()
-            losses.append(loss.item())
+            train_loss += loss.item()
+            train_steps += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        
+        avg_train_loss = train_loss / train_steps if train_steps > 0 else 0.0
+        
+        # Validation phase
+        model.eval()
+        lm_head.eval()
+        val_loss = 0.0
+        val_steps = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{max_epochs} [Val]"):
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                
+                outputs = model.gpt(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                hidden_states = outputs.last_hidden_state
+                logits = lm_head(hidden_states)
+                
+                logits_flat = logits.view(-1, logits.size(-1))
+                labels_flat = labels.view(-1)
+                loss = criterion(logits_flat, labels_flat)
+                
+                val_loss += loss.item()
+                val_steps += 1
+        
+        avg_val_loss = val_loss / val_steps if val_steps > 0 else 0.0
+        
+        print(f"\nEpoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}")
+        
+        # Check for improvement
+        if avg_val_loss < best_val_loss:
+            print(f"  ✓ Validation loss improved! ({best_val_loss:.4f} -> {avg_val_loss:.4f})")
+            best_val_loss = avg_val_loss
+            best_epoch = epoch + 1
+            patience_counter = 0
             
-            pbar.update(1)
-            pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "avg_loss": f"{total_loss/step:.4f}",
-                "elapsed": f"{elapsed_minutes:.1f}m",
-            })
+            # Save best model state
+            best_model_state = model.state_dict().copy()
+            best_lm_head_state = lm_head.state_dict().copy()
+            best_optimizer_state = optimizer.state_dict().copy()
             
-            # Save checkpoint periodically
-            if current_time >= next_checkpoint_time:
-                checkpoint_path = paths["model_checkpoints"] / f"model_step_{step}_time_{int(elapsed_minutes)}m.pt"
-                save_model_checkpoint(model, lm_head, optimizer, step, checkpoint_path)
-                print(f"\n✓ Saved checkpoint at step {step} ({elapsed_minutes:.1f} minutes): {checkpoint_path}")
-                next_checkpoint_time = current_time + checkpoint_interval_seconds
+            # Save checkpoint for best model
+            best_checkpoint_path = paths["model_checkpoints"] / "model_best.pt"
+            save_model_checkpoint(model, lm_head, optimizer, epoch + 1, best_checkpoint_path)
+            print(f"  ✓ Saved best model checkpoint: {best_checkpoint_path}")
+        else:
+            patience_counter += 1
+            print(f"  No improvement. Patience: {patience_counter}/{patience}")
+            
+            # Early stopping check
+            if patience_counter >= patience:
+                print(f"\n⚠ Early stopping triggered after {epoch+1} epochs!")
+                print(f"  Best validation loss: {best_val_loss:.4f} (at epoch {best_epoch})")
+                break
     
-    pbar.close()
+    # Load best model state
+    if best_model_state is not None:
+        print(f"\nLoading best model from epoch {best_epoch} (val_loss={best_val_loss:.4f})")
+        model.load_state_dict(best_model_state)
+        lm_head.load_state_dict(best_lm_head_state)
+        optimizer.load_state_dict(best_optimizer_state)
     
-    # Save final model
+    # Final checkpoint save
     final_checkpoint_path = paths["model_checkpoints"] / "model_final.pt"
-    save_model_checkpoint(model, lm_head, optimizer, step, final_checkpoint_path)
-    print(f"\n✓ Training complete! Final checkpoint: {final_checkpoint_path}")
-    print(f"  Total steps: {step}")
-    print(f"  Average loss: {total_loss/step:.4f}")
+    save_model_checkpoint(model, lm_head, optimizer, best_epoch, final_checkpoint_path)
+    print(f"\n✓ Training complete! Best checkpoint: {paths['model_checkpoints'] / 'model_best.pt'}")
+    print(f"  Best epoch: {best_epoch}")
+    print(f"  Best validation loss: {best_val_loss:.4f}")
     
-    return final_checkpoint_path
+    return paths["model_checkpoints"] / "model_best.pt", lm_head
 
 
 def save_model_checkpoint(
@@ -487,27 +545,35 @@ def main():
     model_checkpoint = args.checkpoint
     if model_checkpoint and Path(model_checkpoint).exists() and model_checkpoint.endswith('.pt'):
         print(f"Loading pretrained model from {model_checkpoint}")
-        # Load the model checkpoint (we'll skip LM head for now)
+        # Load the model checkpoint
         checkpoint = torch.load(model_checkpoint, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         print("✓ Loaded pretrained model")
+        
+        # Load LM head from checkpoint if available
+        vocab_size = model_config.vocab_size
+        n_embd = model_config.n_embd
+        lm_head = nn.Linear(n_embd, vocab_size).to(device)
+        if "lm_head_state_dict" in checkpoint:
+            lm_head.load_state_dict(checkpoint["lm_head_state_dict"])
+            print("✓ Loaded LM head from checkpoint")
     else:
         # Train the model on book texts
         print("\n" + "="*60)
         print("TRAINING PHASE: Fine-tuning GPT2 on book texts")
         print("="*60)
-        train_gpt2_on_books(
+        best_checkpoint_path, lm_head = train_gpt2_on_books(
             model=model,
             loader=loader,
             model_config=model_config,
             device=device,
             paths=paths,
-            target_minutes=30.0,
-            checkpoint_interval_minutes=5.0,
+            max_epochs=100,
+            patience=3,
         )
     
-    # Create wrapper with the trained/loaded model
-    wrapper = MiniGPT2Wrapper(model_config, inference_config, device, model=model)
+    # Create wrapper with the trained/loaded model and LM head
+    wrapper = MiniGPT2Wrapper(model_config, inference_config, device, model=model, lm_head=lm_head)
     
     # Evaluate on train.csv
     accuracy = evaluate_on_train_csv(

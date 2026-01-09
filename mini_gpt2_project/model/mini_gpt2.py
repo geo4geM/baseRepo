@@ -36,7 +36,7 @@ class MiniGPT2(BaseModel):
             n_embd=config.n_embd,
             n_layer=config.n_layer,
             n_head=config.n_head,
-            resid_pdrop=0.1,
+            resid_pdrop=0.2,  # Increased dropout for better generalization
         )
 
         self.gpt = GPT2Model(gpt_config)
