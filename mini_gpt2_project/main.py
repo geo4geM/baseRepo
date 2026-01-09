@@ -144,7 +144,7 @@ def train_gpt2_on_books(
     model_config: ModelConfig,
     device: torch.device,
     paths: Dict[str, Path],
-    max_steps: int = 5000,
+    max_steps: int = 1000,
     batch_size: int = 24,
 ) -> Tuple[Path, nn.Module]:
     """
@@ -457,7 +457,7 @@ def main():
             model_config=model_config,
             device=device,
             paths=paths,
-            max_steps=5000,         # <--- number of gradient steps to train for (ex: 2000, adjust as needed)
+            max_steps=1000,         # <--- number of gradient steps to train for (ex: 2000, adjust as needed)
             batch_size=24,           # <--- large, since you have plenty of memory
         )
 
