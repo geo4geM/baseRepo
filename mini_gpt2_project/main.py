@@ -20,20 +20,21 @@ import torch
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 
-# Add project to path
+# Add project to path (for local execution)
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # --- MODIFIED IMPORTS FOR MINI-GPT2 ---
-from config.model_config import (
+# Use relative imports so this works both locally and when imported as a package
+from .config.model_config import (
     get_config_by_name,
     InferenceConfig,
     get_device,
     get_dtype,
 )
-from metrics.analysis_metrics import ConsistencyMetrics, CalibrationResult
-from utils.data_loader import DataLoader, get_dataset_stats
-from inference.predictor import MiniGPT2Wrapper
+from .metrics.analysis_metrics import ConsistencyMetrics, CalibrationResult
+from .utils.data_loader import DataLoader, get_dataset_stats
+from .inference.predictor import MiniGPT2Wrapper
 # ---------------------------------------
 
 def parse_args():
