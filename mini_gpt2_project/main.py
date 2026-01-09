@@ -10,15 +10,19 @@ import json
 import os
 import sys
 import pickle
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
 import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader as TorchDataLoader
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 # Add project to path (for local execution)
 PROJECT_ROOT = Path(__file__).parent
@@ -29,12 +33,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from .config.model_config import (
     get_config_by_name,
     InferenceConfig,
+    ModelConfig,
     get_device,
     get_dtype,
 )
 from .metrics.analysis_metrics import ConsistencyMetrics, CalibrationResult
-from .utils.data_loader import DataLoader, get_dataset_stats
+from .utils.data_loader import DataLoader, ByteTokenizer, get_dataset_stats
 from .inference.predictor import MiniGPT2Wrapper
+from .model.mini_gpt2 import MiniGPT2
 # ---------------------------------------
 
 def parse_args():
@@ -65,6 +71,7 @@ def setup_directories(output_dir: str) -> Dict[str, Path]:
     paths = {
         "output": Path(output_dir),
         "checkpoints": Path(output_dir) / "checkpoints",
+        "model_checkpoints": Path(output_dir) / "checkpoints" / "models",
         "plots": Path(output_dir) / "plots",
     }
     for path in paths.values():
@@ -100,6 +107,278 @@ def load_checkpoint(path: Path) -> CalibrationResult:
     calibration.contradict_mean = data["calibration"]["contradict_mean"]
     calibration.contradict_std = data["calibration"]["contradict_std"]
     return calibration
+
+class BookTextDataset(Dataset):
+    """Dataset for fine-tuning GPT2 on book texts."""
+    
+    def __init__(self, token_chunks: List[List[int]], max_seq_len: int = 1024):
+        self.token_chunks = token_chunks
+        self.max_seq_len = max_seq_len
+        
+    def __len__(self) -> int:
+        return len(self.token_chunks)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        chunk = self.token_chunks[idx]
+        # Truncate or pad to max_seq_len
+        if len(chunk) > self.max_seq_len:
+            chunk = chunk[:self.max_seq_len]
+        else:
+            chunk = chunk + [0] * (self.max_seq_len - len(chunk))
+        
+        input_ids = torch.tensor(chunk, dtype=torch.long)
+        # For language modeling: input_ids and labels are the same (shifted in model)
+        labels = input_ids.clone()
+        attention_mask = (input_ids != 0).long()
+        
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+
+def train_gpt2_on_books(
+    model: MiniGPT2,
+    loader: DataLoader,
+    model_config: ModelConfig,
+    device: torch.device,
+    paths: Dict[str, Path],
+    target_minutes: float = 30.0,
+    checkpoint_interval_minutes: float = 5.0,
+) -> Path:
+    """Fine-tune GPT2 on book texts using language modeling objective.
+    
+    Args:
+        model: The MiniGPT2 model to train.
+        loader: DataLoader instance with book paths.
+        model_config: Model configuration.
+        device: Torch device.
+        paths: Dictionary of output paths.
+        target_minutes: Target training time in minutes.
+        checkpoint_interval_minutes: Interval between checkpoints in minutes.
+        
+    Returns:
+        Path to the final trained model checkpoint.
+    """
+    print("\n" + "="*60 + "\nPHASE 0: FINE-TUNING GPT2 ON BOOK TEXTS\n" + "="*60)
+    
+    # Collect all book texts and tokenize
+    tokenizer = ByteTokenizer()
+    all_chunks: List[List[int]] = []
+    
+    print("Loading and tokenizing book texts...")
+    for book_name in loader.book_mapping.keys():
+        book_path = loader.get_book_path(book_name)
+        print(f"Processing: {book_name}")
+        with open(book_path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+        chunks = tokenizer.chunk_text(text, chunk_size=model_config.max_seq_len)
+        all_chunks.extend(chunks)
+        print(f"  Added {len(chunks)} chunks from {book_name}")
+    
+    print(f"\nTotal chunks: {len(all_chunks)}")
+    
+    # Create dataset and dataloader
+    dataset = BookTextDataset(all_chunks, max_seq_len=model_config.max_seq_len)
+    train_loader = TorchDataLoader(
+        dataset,
+        batch_size=4,  # Small batch size for memory efficiency
+        shuffle=True,
+        num_workers=0,
+    )
+    
+    # Setup optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
+    
+    # Language modeling loss (we'll use the GPT2's built-in LM head)
+    # Since we're using GPT2Model (not GPT2LMHeadModel), we need to add LM head
+    lm_head = nn.Linear(model_config.n_embd, model_config.vocab_size).to(device)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding tokens
+    
+    model.train()
+    lm_head.train()
+    
+    # Training loop with time-based stopping
+    start_time = time.time()
+    target_seconds = target_minutes * 60
+    checkpoint_interval_seconds = checkpoint_interval_minutes * 60
+    next_checkpoint_time = start_time + checkpoint_interval_seconds
+    
+    step = 0
+    total_loss = 0.0
+    losses = []
+    
+    print(f"\nStarting training (target: {target_minutes} minutes)...")
+    print(f"Checkpoints will be saved every {checkpoint_interval_minutes} minutes")
+    
+    pbar = tqdm(desc="Training", unit="step")
+    
+    while (time.time() - start_time) < target_seconds:
+        for batch in train_loader:
+            current_time = time.time()
+            elapsed_minutes = (current_time - start_time) / 60
+            
+            if (current_time - start_time) >= target_seconds:
+                break
+            
+            # Move batch to device
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            
+            # Forward pass through GPT2
+            outputs = model.gpt(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            hidden_states = outputs.last_hidden_state  # (B, T, H)
+            
+            # Apply LM head
+            logits = lm_head(hidden_states)  # (B, T, vocab_size)
+            
+            # Reshape for loss: (B*T, vocab_size) and (B*T,)
+            logits_flat = logits.view(-1, logits.size(-1))
+            labels_flat = labels.view(-1)
+            
+            # Compute loss
+            loss = criterion(logits_flat, labels_flat)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            step += 1
+            total_loss += loss.item()
+            losses.append(loss.item())
+            
+            pbar.update(1)
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "avg_loss": f"{total_loss/step:.4f}",
+                "elapsed": f"{elapsed_minutes:.1f}m",
+            })
+            
+            # Save checkpoint periodically
+            if current_time >= next_checkpoint_time:
+                checkpoint_path = paths["model_checkpoints"] / f"model_step_{step}_time_{int(elapsed_minutes)}m.pt"
+                save_model_checkpoint(model, lm_head, optimizer, step, checkpoint_path)
+                print(f"\n✓ Saved checkpoint at step {step} ({elapsed_minutes:.1f} minutes): {checkpoint_path}")
+                next_checkpoint_time = current_time + checkpoint_interval_seconds
+    
+    pbar.close()
+    
+    # Save final model
+    final_checkpoint_path = paths["model_checkpoints"] / "model_final.pt"
+    save_model_checkpoint(model, lm_head, optimizer, step, final_checkpoint_path)
+    print(f"\n✓ Training complete! Final checkpoint: {final_checkpoint_path}")
+    print(f"  Total steps: {step}")
+    print(f"  Average loss: {total_loss/step:.4f}")
+    
+    return final_checkpoint_path
+
+
+def save_model_checkpoint(
+    model: MiniGPT2,
+    lm_head: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    checkpoint_path: Path,
+) -> None:
+    """Save model checkpoint."""
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "lm_head_state_dict": lm_head.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "step": step,
+        "timestamp": datetime.now().isoformat(),
+    }, checkpoint_path)
+
+
+def load_model_checkpoint(
+    model: MiniGPT2,
+    lm_head: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: Path,
+    device: torch.device,
+) -> int:
+    """Load model checkpoint and return step number."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    lm_head.load_state_dict(checkpoint["lm_head_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    step = checkpoint.get("step", 0)
+    print(f"✓ Loaded checkpoint from step {step}")
+    return step
+
+
+def evaluate_on_train_csv(
+    model: MiniGPT2,
+    loader: DataLoader,
+    model_config: ModelConfig,
+    device: torch.device,
+    paths: Dict[str, Path],
+) -> float:
+    """Evaluate trained model on train.csv and compute accuracy.
+    
+    Returns:
+        Accuracy score on train.csv.
+    """
+    print("\n" + "="*60 + "\nEVALUATING ON TRAIN.CSV\n" + "="*60)
+    
+    model.eval()
+    tokenizer = ByteTokenizer()
+    
+    train_examples = loader.get_train_examples()
+    predictions = []
+    true_labels = []
+    
+    print(f"Evaluating on {len(train_examples)} examples...")
+    
+    with torch.no_grad():
+        for example in tqdm(train_examples, desc="Evaluating"):
+            try:
+                # Tokenize backstory
+                tokens = tokenizer.encode(example['content'])
+                if len(tokens) > model_config.max_seq_len:
+                    tokens = tokens[:model_config.max_seq_len]
+                else:
+                    tokens = tokens + [0] * (model_config.max_seq_len - len(tokens))
+                
+                input_ids = torch.tensor([tokens], dtype=torch.long).to(device)
+                attention_mask = (input_ids != 0).long().to(device)
+                
+                # Forward pass
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs["logits"]
+                
+                # Get prediction
+                pred = logits.argmax(dim=-1).item()
+                predictions.append(pred)
+                true_labels.append(example['label_binary'])
+                
+            except Exception as e:
+                print(f"Error on example {example['id']}: {e}")
+                predictions.append(1)  # Default to consistent
+                true_labels.append(example['label_binary'])
+    
+    # Compute accuracy
+    accuracy = accuracy_score(true_labels, predictions)
+    print(f"\n✓ Accuracy on train.csv: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    
+    # Save results
+    results_df = pd.DataFrame({
+        "id": [ex['id'] for ex in train_examples],
+        "true_label": true_labels,
+        "predicted_label": predictions,
+    })
+    results_df.to_csv(paths["output"] / "train_evaluation.csv", index=False)
+    print(f"✓ Saved evaluation results to {paths['output']}/train_evaluation.csv")
+    
+    return accuracy
+
 
 def precompute_novel_states(wrapper: MiniGPT2Wrapper, loader: DataLoader, paths: Dict[str, Path]) -> Dict[str, any]:
     cache_path = paths["checkpoints"] / "novel_states.pkl"
@@ -202,7 +481,42 @@ def main():
     loader = DataLoader(base_path=PROJECT_ROOT.parent)
     
     print("Initializing Model...")
-    wrapper = MiniGPT2Wrapper(model_config, inference_config, device)
+    model = MiniGPT2(model_config).to(device)
+    
+    # Check if we should load a pretrained model
+    model_checkpoint = args.checkpoint
+    if model_checkpoint and Path(model_checkpoint).exists() and model_checkpoint.endswith('.pt'):
+        print(f"Loading pretrained model from {model_checkpoint}")
+        # Load the model checkpoint (we'll skip LM head for now)
+        checkpoint = torch.load(model_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print("✓ Loaded pretrained model")
+    else:
+        # Train the model on book texts
+        print("\n" + "="*60)
+        print("TRAINING PHASE: Fine-tuning GPT2 on book texts")
+        print("="*60)
+        train_gpt2_on_books(
+            model=model,
+            loader=loader,
+            model_config=model_config,
+            device=device,
+            paths=paths,
+            target_minutes=30.0,
+            checkpoint_interval_minutes=5.0,
+        )
+    
+    # Create wrapper with the trained/loaded model
+    wrapper = MiniGPT2Wrapper(model_config, inference_config, device, model=model)
+    
+    # Evaluate on train.csv
+    accuracy = evaluate_on_train_csv(
+        model=model,
+        loader=loader,
+        model_config=model_config,
+        device=device,
+        paths=paths,
+    )
     
     run_train = not args.inference
     run_infer = not args.train

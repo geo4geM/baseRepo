@@ -28,6 +28,7 @@ class MiniGPT2Wrapper:
         model_config: ModelConfig,
         inference_config: InferenceConfig,
         device: torch.device,
+        model: Optional[MiniGPT2] = None,
     ) -> None:
         """Initialize the MiniGPT2Wrapper.
 
@@ -36,8 +37,12 @@ class MiniGPT2Wrapper:
             inference_config: Configuration for inference-time behavior such
                 as chunk size and damping.
             device: Torch device on which the model will be placed.
+            model: Optional pre-trained MiniGPT2 model. If None, creates a new one.
         """
-        self.model = MiniGPT2(model_config).to(device)
+        if model is not None:
+            self.model = model.to(device)
+        else:
+            self.model = MiniGPT2(model_config).to(device)
         self.model.eval()
 
         self.inference_config = inference_config
