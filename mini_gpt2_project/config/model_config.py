@@ -27,7 +27,7 @@ class ModelConfig:
         num_classes: Number of output classes for classification.
     """
 
-    vocab_size: int = 256
+    vocab_size: int = 5000
     n_embd: int = 704
     n_layer: int = 4
     n_head: int = 11

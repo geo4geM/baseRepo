@@ -144,50 +144,74 @@ def train_gpt2_on_books(
     model_config: ModelConfig,
     device: torch.device,
     paths: Dict[str, Path],
-    max_steps: int = 500,     # <--- Fixed step count
-    batch_size: int = 32,      # <--- Quadruple (if you used 4 before), adjust up as RAM/gpu allows
+    max_steps: int = 500,
+    batch_size: int = 32,
 ) -> Tuple[Path, nn.Module]:
-    """Fine-tune GPT2 on book texts using language modeling objective with a fixed number of steps."""
+    """
+    Fine-tune GPT2 on book texts using language modeling objective.
+    Now supports training the tokenizer if vocab files are missing.
+    """
     print("\n" + "="*60 + "\nPHASE 0: FINE-TUNING GPT2 ON BOOK TEXTS\n" + "="*60)
     
-    tokenizer = get_tokenizer(model_config)
-    all_chunks: List[List[int]] = []
+    # 1. Gather all book paths for tokenizer training
+    book_paths = [str(loader.get_book_path(name)) for name in loader.book_mapping.keys()]
     
+    # 2. Initialize (and potentially train) the Tokenizer
+    print("Initializing Tokenizer...")
+    # This will trigger training if 'vocab.json' is missing
+    tokenizer = get_tokenizer(model_config, training_files=book_paths)
+    
+    # 3. Load and Tokenize text
+    all_chunks: List[List[int]] = []
     print("Loading and tokenizing book texts...")
+    
     for book_name in loader.book_mapping.keys():
         book_path = loader.get_book_path(book_name)
         print(f"Processing: {book_name}")
+        
         with open(book_path, 'r', encoding='utf-8', errors='replace') as f:
             text = f.read()
+            
+        # chunk_text handles the encoding internally
         chunks = tokenizer.chunk_text(text, chunk_size=model_config.max_seq_len)
         all_chunks.extend(chunks)
         print(f"  Added {len(chunks)} chunks from {book_name}")
     
     print(f"\nTotal chunks: {len(all_chunks)}")
     
-    # Use all for training if cutting off by steps (you can still split for validation if you want, but it won't influence stopping)
+    # 4. Prepare Dataset and Loader
     train_dataset = BookTextDataset(all_chunks, max_seq_len=model_config.max_seq_len)
+    
+    # Determine num_workers based on CPU count (safe default is 2 or 4)
+    num_workers = min(os.cpu_count() or 1, 4)
+    
     train_loader = TorchDataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=32,
+        num_workers=num_workers,
+        pin_memory=True
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.1)  # high regularization
-
+    # 5. Setup Optimizer and Loss
+    # We use a lower learning rate for fine-tuning
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.1)
+    
+    # Create a fresh LM head (output layer)
     lm_head = nn.Linear(model_config.n_embd, model_config.vocab_size).to(device)
-    criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding tokens
+    lm_head.train()
+    model.train()
+    
+    criterion = nn.CrossEntropyLoss(ignore_index=0) # 0 is padding in our dataset
 
+    # 6. Training Loop
     step = 0
     total_loss = 0.0
-    losses = []
     pbar = tqdm(total=max_steps, desc="Training", unit="step")
-
-    model.train()
-    lm_head.train()
     
+    # Infinite iterator over the data loader until max_steps is reached
     train_iter = iter(train_loader)
+    
     while step < max_steps:
         try:
             batch = next(train_iter)
@@ -195,16 +219,25 @@ def train_gpt2_on_books(
             train_iter = iter(train_loader)
             batch = next(train_iter)
         
+        # Move data to device
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        
+        # Forward pass
         outputs = model.gpt(input_ids=input_ids, attention_mask=attention_mask)
         hidden_states = outputs.last_hidden_state
+        
+        # Compute logits and loss
         logits = lm_head(hidden_states)
+        
+        # Flatten for loss calculation: (batch * seq_len, vocab_size)
         logits_flat = logits.view(-1, logits.size(-1))
         labels_flat = labels.view(-1)
+        
         loss = criterion(logits_flat, labels_flat)
 
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -212,20 +245,19 @@ def train_gpt2_on_books(
 
         step += 1
         total_loss += loss.item()
-        losses.append(loss.item())
+        
         pbar.update(1)
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
             "avg_loss": f"{total_loss/step:.4f}",
         })
 
-        # Optionally, save checkpoints every N steps here...
-
     pbar.close()
 
-    # Save final model
+    # 7. Save Final Model
     final_checkpoint_path = paths["model_checkpoints"] / "model_final.pt"
     save_model_checkpoint(model, lm_head, optimizer, step, final_checkpoint_path)
+    
     print(f"\n✓ Training complete! Final checkpoint: {final_checkpoint_path}")
     print(f"  Total steps: {step}")
     print(f"  Average loss: {total_loss/step:.4f}")
