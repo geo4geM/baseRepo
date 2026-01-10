@@ -1,4 +1,4 @@
-"""Metrics package for evaluating Mini-GPT2 and baseline models."""
+"""Metrics package for evaluating consistency models."""
 
 # Metrics module
 from .analysis_metrics import (

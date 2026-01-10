@@ -1,8 +1,8 @@
-"""Local entry point for running training and evaluation of Mini-GPT2 models."""
+"""Local entry point for running training and evaluation of Narrative Consistency models."""
 
 """
-Mini-GPT2 Track B: Main Pipeline
-Narrative consistency classification using Mini-GPT2 architecture.
+Narrative Consistency Pipeline: Main
+Supports both Recurrent BDH and Mini-GPT2 architectures via config switching.
 """
 
 import argparse
@@ -30,7 +30,7 @@ from mini_gpt2_project.utils.data_loader import get_tokenizer
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# --- MODIFIED IMPORTS FOR MINI-GPT2 ---
+# --- MODIFIED IMPORTS FOR DYNAMIC MODEL LOADING ---
 from .config.model_config import (
     get_config_by_name,
     InferenceConfig,
@@ -40,20 +40,21 @@ from .config.model_config import (
 )
 from .metrics.analysis_metrics import ConsistencyMetrics, CalibrationResult
 from .utils.data_loader import DataLoader, ByteTokenizer, get_dataset_stats
-from .inference.predictor import MiniGPT2Wrapper
+from .inference.predictor import NarrativePredictor  # Unified Wrapper
+from .model.bdh_recurrent import RecurrentBDH, RecurrentState
 from .model.mini_gpt2 import MiniGPT2
 # ---------------------------------------
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Mini-GPT2 Narrative Consistency")
+    parser = argparse.ArgumentParser(description="Narrative Consistency Pipeline")
     
     # Mode selection
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--train", action="store_true", help="Run calibration/training only")
     mode_group.add_argument("--inference", action="store_true", help="Run test inference only")
     
-    # Model size (kept for compatibility, though we only have one config now)
+    # Model size (kept for compatibility)
     size_group = parser.add_mutually_exclusive_group()
     size_group.add_argument("--default", action="store_true", help="Use default model")
     size_group.add_argument("--small", action="store_true", help="Use small model")
@@ -110,7 +111,7 @@ def load_checkpoint(path: Path) -> CalibrationResult:
     return calibration
 
 class BookTextDataset(Dataset):
-    """Dataset for fine-tuning GPT2 on book texts."""
+    """Dataset for fine-tuning on book texts."""
     
     def __init__(self, token_chunks: List[List[int]], max_seq_len: int = 1024):
         self.token_chunks = token_chunks
@@ -128,7 +129,6 @@ class BookTextDataset(Dataset):
             chunk = chunk + [0] * (self.max_seq_len - len(chunk))
         
         input_ids = torch.tensor(chunk, dtype=torch.long)
-        # For language modeling: input_ids and labels are the same (shifted in model)
         labels = input_ids.clone()
         attention_mask = (input_ids != 0).long()
         
@@ -138,27 +138,26 @@ class BookTextDataset(Dataset):
             "labels": labels,
         }
 
-def train_gpt2_on_books(
-    model: MiniGPT2,
+def train_on_books(
+    model: nn.Module,
     loader: DataLoader,
     model_config: ModelConfig,
     device: torch.device,
     paths: Dict[str, Path],
     max_steps: int = 1000,
     batch_size: int = 24,
-) -> Tuple[Path, nn.Module]:
+) -> Tuple[Path, Optional[nn.Module]]:
     """
-    Fine-tune GPT2 on book texts using language modeling objective.
-    Now supports training the tokenizer if vocab files are missing.
+    Fine-tune model (BDH or GPT-2) on book texts using language modeling objective.
+    Adapts training step based on model_type.
     """
-    print("\n" + "="*60 + "\nPHASE 0: FINE-TUNING GPT2 ON BOOK TEXTS\n" + "="*60)
+    print(f"\n{'='*60}\nPHASE 0: FINE-TUNING {model_config.model_type.upper()} ON BOOKS\n{'='*60}")
     
     # 1. Gather all book paths for tokenizer training
     book_paths = [str(loader.get_book_path(name)) for name in loader.book_mapping.keys()]
     
-    # 2. Initialize (and potentially train) the Tokenizer
+    # 2. Initialize Tokenizer
     print("Initializing Tokenizer...")
-    # This will trigger training if 'vocab.json' is missing
     tokenizer = get_tokenizer(model_config, training_files=book_paths)
     
     # 3. Load and Tokenize text
@@ -172,7 +171,6 @@ def train_gpt2_on_books(
         with open(book_path, 'r', encoding='utf-8', errors='replace') as f:
             text = f.read()
             
-        # chunk_text handles the encoding internally
         chunks = tokenizer.chunk_text(text, chunk_size=model_config.max_seq_len)
         all_chunks.extend(chunks)
         print(f"  Added {len(chunks)} chunks from {book_name}")
@@ -181,8 +179,6 @@ def train_gpt2_on_books(
     
     # 4. Prepare Dataset and Loader
     train_dataset = BookTextDataset(all_chunks, max_seq_len=model_config.max_seq_len)
-    
-    # Determine num_workers based on CPU count (safe default is 2 or 4)
     num_workers = min(os.cpu_count() or 1, 4)
     
     train_loader = TorchDataLoader(
@@ -194,22 +190,14 @@ def train_gpt2_on_books(
     )
 
     # 5. Setup Optimizer and Loss
-    # We use a lower learning rate for fine-tuning
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.1)
-    
-    # Create a fresh LM head (output layer)
-    lm_head = nn.Linear(model_config.n_embd, model_config.vocab_size).to(device)
-    lm_head.train()
     model.train()
-    
-    criterion = nn.CrossEntropyLoss(ignore_index=0) # 0 is padding in our dataset
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
 
     # 6. Training Loop
     step = 0
     total_loss = 0.0
     pbar = tqdm(total=max_steps, desc="Training", unit="step")
-    
-    # Infinite iterator over the data loader until max_steps is reached
     train_iter = iter(train_loader)
     
     while step < max_steps:
@@ -219,26 +207,38 @@ def train_gpt2_on_books(
             train_iter = iter(train_loader)
             batch = next(train_iter)
         
-        # Move data to device
         input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
         
-        # Forward pass
-        outputs = model.gpt(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state
-        
-        # Compute logits and loss
-        logits = lm_head(hidden_states)
-        
-        # Flatten for loss calculation: (batch * seq_len, vocab_size)
-        logits_flat = logits.view(-1, logits.size(-1))
-        labels_flat = labels.view(-1)
-        
-        loss = criterion(logits_flat, labels_flat)
-
-        # Backward pass
         optimizer.zero_grad()
+        
+        loss = None
+        
+        # --- CONDITIONAL FORWARD PASS ---
+        if model_config.model_type == "bdh":
+            # RecurrentBDH: manual loss calculation from logits
+            logits, _, _ = model(idx=input_ids)
+            logits_flat = logits.view(-1, logits.size(-1))
+            labels_flat = labels.view(-1)
+            loss = criterion(logits_flat, labels_flat)
+            
+        else:
+            # MiniGPT2: forward returns dict with 'loss' if labels provided
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+            loss = outputs.get("loss")
+            # If model didn't compute loss, do it manually
+            if loss is None:
+                logits = outputs["logits"]
+                logits_flat = logits.view(-1, logits.size(-1))
+                labels_flat = labels.view(-1)
+                loss = criterion(logits_flat, labels_flat)
+        # --------------------------------
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -256,57 +256,63 @@ def train_gpt2_on_books(
 
     # 7. Save Final Model
     final_checkpoint_path = paths["model_checkpoints"] / "model_final.pt"
-    save_model_checkpoint(model, lm_head, optimizer, step, final_checkpoint_path)
+    # We pass None for lm_head as it's handled internally or via the model object
+    save_model_checkpoint(model, None, optimizer, step, final_checkpoint_path)
     
     print(f"\n✓ Training complete! Final checkpoint: {final_checkpoint_path}")
     print(f"  Total steps: {step}")
     print(f"  Average loss: {total_loss/step:.4f}")
 
-    return final_checkpoint_path, lm_head
+    return final_checkpoint_path, None
 
 def save_model_checkpoint(
-    model: MiniGPT2,
-    lm_head: nn.Module,
+    model: nn.Module,
+    lm_head: Optional[nn.Module],
     optimizer: torch.optim.Optimizer,
     step: int,
     checkpoint_path: Path,
 ) -> None:
     """Save model checkpoint."""
-    torch.save({
+    state_dict = {
         "model_state_dict": model.state_dict(),
-        "lm_head_state_dict": lm_head.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "step": step,
         "timestamp": datetime.now().isoformat(),
-    }, checkpoint_path)
+    }
+    if lm_head is not None:
+        state_dict["lm_head_state_dict"] = lm_head.state_dict()
+        
+    torch.save(state_dict, checkpoint_path)
 
 def load_model_checkpoint(
-    model: MiniGPT2,
-    lm_head: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    model: nn.Module,
+    lm_head: Optional[nn.Module],
+    optimizer: Optional[torch.optim.Optimizer],
     checkpoint_path: Path,
     device: torch.device,
 ) -> int:
     """Load model checkpoint and return step number."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    lm_head.load_state_dict(checkpoint["lm_head_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    
+    if lm_head is not None and "lm_head_state_dict" in checkpoint:
+        lm_head.load_state_dict(checkpoint["lm_head_state_dict"])
+        
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        
     step = checkpoint.get("step", 0)
     print(f"✓ Loaded checkpoint from step {step}")
     return step
 
 def evaluate_on_train_csv(
-    model: MiniGPT2,
+    model: nn.Module,
     loader: DataLoader,
     model_config: ModelConfig,
     device: torch.device,
     paths: Dict[str, Path],
 ) -> float:
-    """Evaluate trained model on train.csv and compute accuracy.
-    Returns:
-        Accuracy score on train.csv.
-    """
+    """Evaluate trained model on train.csv."""
     print("\n" + "="*60 + "\nEVALUATING ON TRAIN.CSV\n" + "="*60)
     model.eval()
     tokenizer = get_tokenizer(model_config)
@@ -324,16 +330,27 @@ def evaluate_on_train_csv(
                 else:
                     tokens = tokens + [0] * (model_config.max_seq_len - len(tokens))
                 input_ids = torch.tensor([tokens], dtype=torch.long).to(device)
-                attention_mask = (input_ids != 0).long().to(device)
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = outputs["logits"]
-                pred = logits.argmax(dim=-1).item()
-                predictions.append(pred)
+                
+                # --- CONDITIONAL FORWARD PASS ---
+                if model_config.model_type == "bdh":
+                    logits, _, _ = model(idx=input_ids)
+                else:
+                    attention_mask = torch.ones_like(input_ids)
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    logits = outputs["logits"]
+                # --------------------------------
+                
+                # Check prediction (simple heuristic for binary consistency check)
+                pred = logits[0, -1].argmax().item()
+                pred_binary = 1 if pred % 2 != 0 else 0 
+                
+                predictions.append(pred_binary)
                 true_labels.append(example['label_binary'])
             except Exception as e:
                 print(f"Error on example {example['id']}: {e}")
                 predictions.append(1)  # Default to consistent
                 true_labels.append(example['label_binary'])
+    
     accuracy = accuracy_score(true_labels, predictions)
     print(f"\n✓ Accuracy on train.csv: {accuracy:.4f} ({accuracy*100:.2f}%)")
     results_df = pd.DataFrame({
@@ -345,7 +362,7 @@ def evaluate_on_train_csv(
     print(f"✓ Saved evaluation results to {paths['output']}/train_evaluation.csv")
     return accuracy
 
-def precompute_novel_states(wrapper: MiniGPT2Wrapper, loader: DataLoader, paths: Dict[str, Path]) -> Dict[str, any]:
+def precompute_novel_states(wrapper: NarrativePredictor, loader: DataLoader, paths: Dict[str, Path]) -> Dict[str, any]:
     cache_path = paths["checkpoints"] / "novel_states.pkl"
     if cache_path.exists():
         print(f"\n✓ Loading cached novel states from {cache_path}")
@@ -363,7 +380,7 @@ def precompute_novel_states(wrapper: MiniGPT2Wrapper, loader: DataLoader, paths:
         pickle.dump(novel_states, f)
     return novel_states
 
-def run_calibration(wrapper: MiniGPT2Wrapper, loader: DataLoader, novel_states: Dict, paths: Dict, args, config_name: str, is_validation: bool = False) -> CalibrationResult:
+def run_calibration(wrapper: NarrativePredictor, loader: DataLoader, novel_states: Dict, paths: Dict, args, config_name: str, is_validation: bool = False) -> CalibrationResult:
     phase_name = "VALIDATION" if is_validation else "CALIBRATION"
     print(f"\n{'='*60}\nPHASE {'2' if is_validation else '1'}: {phase_name}\n{'='*60}")
     train_examples = loader.get_train_examples()
@@ -397,7 +414,7 @@ def run_calibration(wrapper: MiniGPT2Wrapper, loader: DataLoader, novel_states: 
         save_checkpoint(calibration, paths["checkpoints"] / "calibration_final.json", config_name)
     return calibration
 
-def run_inference(wrapper: MiniGPT2Wrapper, loader: DataLoader, novel_states: Dict, calibration: CalibrationResult, paths: Dict, args) -> pd.DataFrame:
+def run_inference(wrapper: NarrativePredictor, loader: DataLoader, novel_states: Dict, calibration: CalibrationResult, paths: Dict, args) -> pd.DataFrame:
     print("\n" + "="*60 + "\nPHASE 3: TEST INFERENCE\n" + "="*60)
     test_examples = loader.get_test_examples()
     if args.limit: test_examples = test_examples[:args.limit]
@@ -422,7 +439,7 @@ def run_inference(wrapper: MiniGPT2Wrapper, loader: DataLoader, novel_states: Di
 
 def main():
     args = parse_args()
-    print("="*60 + "\nMINI-GPT2 TRACK B PIPELINE\n" + "="*60)
+    print("="*60 + "\nNARRATIVE CONSISTENCY PIPELINE\n" + "="*60)
     
     model_config = get_config_by_name("default")
     inference_config = InferenceConfig()
@@ -431,41 +448,40 @@ def main():
     paths = setup_directories(args.output_dir)
     loader = DataLoader(base_path=PROJECT_ROOT.parent)
     
-    print("Initializing Model...")
-    model = MiniGPT2(model_config).to(device)
+    print(f"Selected Model Architecture: {model_config.model_type.upper()}")
+    
+    # 1. Initialize Model (Dynamic Switching)
+    if model_config.model_type == "bdh":
+        print("Initializing Recurrent BDH...")
+        model = RecurrentBDH(model_config).to(device)
+    else:
+        print("Initializing MiniGPT2...")
+        model = MiniGPT2(model_config).to(device)
     
     # Check if we should load a pretrained model
     model_checkpoint = args.checkpoint
     if model_checkpoint and Path(model_checkpoint).exists() and model_checkpoint.endswith('.pt'):
         print(f"Loading pretrained model from {model_checkpoint}")
-        checkpoint = torch.load(model_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        print("✓ Loaded pretrained model")
-        vocab_size = model_config.vocab_size
-        n_embd = model_config.n_embd
-        lm_head = nn.Linear(n_embd, vocab_size).to(device)
-        if "lm_head_state_dict" in checkpoint:
-            lm_head.load_state_dict(checkpoint["lm_head_state_dict"])
-            print("✓ Loaded LM head from checkpoint")
+        load_model_checkpoint(model, None, None, Path(model_checkpoint), device)
     else:
         print("\n" + "="*60)
-        print("TRAINING PHASE: Fine-tuning GPT2 on book texts")
+        print("TRAINING PHASE: Fine-tuning Model on book texts")
         print("="*60)
-        best_checkpoint_path, lm_head = train_gpt2_on_books(
+        best_checkpoint_path, _ = train_on_books(
             model=model,
             loader=loader,
             model_config=model_config,
             device=device,
             paths=paths,
-            max_steps=1000,         # <--- number of gradient steps to train for (ex: 2000, adjust as needed)
-            batch_size=24,           # <--- large, since you have plenty of memory
+            max_steps=1000,
+            batch_size=24,
         )
 
-    # Create wrapper with the trained/loaded model and LM head
-    wrapper = MiniGPT2Wrapper(model_config, inference_config, device, model=model, lm_head=lm_head)
+    # Create wrapper with the trained/loaded model
+    wrapper = NarrativePredictor(model_config, inference_config, device, model=model, lm_head=None)
     
     # Evaluate on train.csv
-    accuracy = evaluate_on_train_csv(
+    evaluate_on_train_csv(
         model=model,
         loader=loader,
         model_config=model_config,

@@ -1,28 +1,26 @@
-"""High-level prediction interface for running Mini-GPT2 and baseline models on new data."""
+"""High-level prediction interface for running Narrative Consistency models."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-import numpy as np
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from ..config.model_config import InferenceConfig, ModelConfig
 from ..model.mini_gpt2 import MiniGPT2
-from ..utils.data_loader import ByteTokenizer
+from ..model.bdh_recurrent import RecurrentBDH, RecurrentState
+from ..utils.data_loader import get_tokenizer
 
-from mini_gpt2_project.utils.data_loader import get_tokenizer
 
+class NarrativePredictor:
+    """Unified wrapper for Narrative Consistency models (GPT-2 or BDH).
 
-class MiniGPT2Wrapper:
-    """Wrapper around `MiniGPT2` for novel-level reasoning and analysis.
-
-    This class mimics the senior `BDHReasoningWrapper` API while using the
-    Mini-GPT2 backbone. It exposes utilities to compute aggregate hidden
-    states for entire novels and backstories, and to compare them via a
-    simple velocity-like distance metric.
+    This class abstracts the underlying model differences:
+    - GPT-2: Uses mean hidden states for representation.
+    - BDH: Uses accumulated ρ-matrix (associative memory) for representation.
     """
 
     def __init__(
@@ -30,98 +28,59 @@ class MiniGPT2Wrapper:
         model_config: ModelConfig,
         inference_config: InferenceConfig,
         device: torch.device,
-        model: Optional[MiniGPT2] = None,
-        lm_head: Optional[torch.nn.Module] = None,
+        model: Optional[nn.Module] = None,
+        lm_head: Optional[nn.Module] = None,
     ) -> None:
-        """Initialize the MiniGPT2Wrapper.
+        """Initialize the Predictor.
 
         Args:
-            model_config: Configuration for the Mini-GPT2 architecture.
-            inference_config: Configuration for inference-time behavior such
-                as chunk size and damping.
-            device: Torch device on which the model will be placed.
-            model: Optional pre-trained MiniGPT2 model. If None, creates a new one.
-            lm_head: Optional language modeling head for loss computation.
-                If None, a new untrained head will be created (loss may be inaccurate).
+            model_config: Configuration for the architecture.
+            inference_config: Configuration for inference-time behavior.
+            device: Torch device.
+            model: Optional pre-trained model instance.
+            lm_head: Optional external language model head (for GPT-2).
         """
         self.model_config = model_config
+        self.inference_config = inference_config
+        self.device = device
+        self.tokenizer = get_tokenizer(self.model_config)
+
+        # 1. Initialize Model if not provided
         if model is not None:
             self.model = model.to(device)
         else:
-            self.model = MiniGPT2(model_config).to(device)
+            if self.model_config.model_type == "bdh":
+                print("Initializing RecurrentBDH for inference...")
+                self.model = RecurrentBDH(model_config).to(device)
+            else:
+                print("Initializing MiniGPT2 for inference...")
+                self.model = MiniGPT2(model_config).to(device)
+        
         self.model.eval()
 
-        self.inference_config = inference_config
-        self.device = device
-        from ..utils.data_loader import get_tokenizer
-        self.tokenizer = get_tokenizer(self.model_config)
-
-        # LM head handling for loss computation
-        if lm_head is not None:
-            self.lm_head = lm_head.to(device)
-            self.lm_head.eval()
+        # 2. Handle LM Head
+        if self.model_config.model_type == "bdh":
+            # BDH has internal head, exposed as property or attribute
+            self.lm_head = getattr(self.model, 'lm_head', None)
         else:
-            vocab_size = self.model.gpt.config.vocab_size
-            n_embd = self.model.gpt.config.n_embd
-            self.lm_head = torch.nn.Linear(n_embd, vocab_size).to(device)
-            self.lm_head.eval()
-
-    def _compute_mean_hidden_state_from_tokens(
-        self,
-        token_chunks: list[list[int]],
-    ) -> Tensor:
-        """Compute the mean hidden state from a list of token chunks.
-
-        Args:
-            token_chunks: List of token id sequences, each representing a text
-                chunk.
-
-        Returns:
-            A tensor representing the mean hidden state over all tokens in all
-            chunks.
-        """
-        hidden_means: list[Tensor] = []
-
-        with torch.no_grad():
-            for chunk in token_chunks:
-                if not chunk:
-                    continue
-                input_ids = torch.tensor(chunk, dtype=torch.long, device=self.device).unsqueeze(0)
-                attention_mask = torch.ones_like(input_ids, device=self.device)
-
-                outputs = self.model.gpt(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                )
-                sequence_output: Tensor = outputs.last_hidden_state  # (1, T, H)
-
-                # Mean over sequence dimension (tokens), keep batch dimension.
-                chunk_mean = sequence_output.mean(dim=1).squeeze(0)  # (H,)
-                hidden_means.append(chunk_mean)
-
-        if not hidden_means:
-            # Return a zero vector if no tokens were processed.
-            # The dimension will be inferred from the model's hidden size.
-            hidden_size = self.model.gpt.config.n_embd
-            return torch.zeros(hidden_size, device=self.device)
-
-        stacked = torch.stack(hidden_means, dim=0)  # (num_chunks, H)
-        return stacked.mean(dim=0)  # (H,)
+            # GPT-2 needs external or internal head management
+            if lm_head is not None:
+                self.lm_head = lm_head.to(device)
+                self.lm_head.eval()
+            else:
+                # Fallback: try to find classifier or create dummy if needed for pure representation
+                # For classification tasks, MiniGPT2 has self.classifier.
+                # For LM tasks, we might need a Linear layer.
+                self.lm_head = getattr(self.model, 'classifier', None)
 
     def compute_novel_state(
         self,
         book_path: Union[str, Path],
         verbose: bool = False,
     ) -> Tensor:
-        """Compute the mean hidden state representation for an entire novel.
-
-        Args:
-            book_path: Path to the book text file.
-            verbose: Whether to print progress information.
-
-        Returns:
-            A tensor on CPU representing the mean hidden state of the novel.
+        """Compute the state representation for an entire novel.
+        
+        Dispatches to specific logic based on model architecture.
         """
         path = Path(book_path)
         if verbose:
@@ -129,128 +88,192 @@ class MiniGPT2Wrapper:
 
         text = path.read_text(encoding="utf-8", errors="replace")
         chunk_size = self.inference_config.chunk_size
-
         token_chunks = self.tokenizer.chunk_text(text, chunk_size)
-        if verbose:
-            print(f"Tokenized into {len(token_chunks)} chunks (chunk_size={chunk_size}).")
 
-        mean_state = self._compute_mean_hidden_state_from_tokens(token_chunks)
-        return mean_state.detach().cpu()
+        if verbose:
+            print(f"Tokenized into {len(token_chunks)} chunks.")
+
+        if self.model_config.model_type == "bdh":
+            return self._compute_bdh_state(token_chunks)
+        else:
+            return self._compute_gpt2_state(token_chunks)
 
     def prime_with_backstory(
         self,
         text: str,
         verbose: bool = False,
-    ) -> Tuple[Tensor, Optional[None]]:
-        """Compute a mean hidden state representation for a backstory.
-
+    ) -> Tuple[Tensor, None]:
+        """Compute state representation for a backstory.
+        
         Args:
-            text: Backstory text to encode.
-            verbose: Whether to print progress information.
-
+            text: Backstory text.
+            verbose: Print debug info.
+            
         Returns:
-            A tuple of ``(mean_hidden_state, None)`` to mirror the senior API.
+            Tuple of (Representation Tensor, None).
         """
-        if verbose:
-            print("Tokenizing backstory text.")
-
         chunk_size = self.inference_config.chunk_size
         token_chunks = self.tokenizer.chunk_text(text, chunk_size)
 
-        mean_state = self._compute_mean_hidden_state_from_tokens(token_chunks)
-        return mean_state.detach().cpu(), None
+        if self.model_config.model_type == "bdh":
+            return self._compute_bdh_state(token_chunks), None
+        else:
+            return self._compute_gpt2_state(token_chunks), None
 
     def compute_velocity_from_states(
-        self,
-        state_backstory: Tensor,
-        state_novel: Tensor,
+        self, 
+        state_backstory: Tensor, 
+        state_novel: Tensor
     ) -> float:
-        """Compute a velocity-like distance between backstory and novel states.
-
-        This is defined as the L2 norm between the two hidden-state vectors.
-
-        Args:
-            state_backstory: Mean hidden state tensor for the backstory.
-            state_novel: Mean hidden state tensor for the novel.
-
-        Returns:
-            The L2 distance as a Python float.
+        """Compute distance between backstory and novel states.
+        
+        Calculates L2 Euclidean distance between the representation vectors
+        (whether they are ρ-matrices or averaged hidden states).
         """
-        # Ensure both states are on the same device and dtype.
+        # Ensure both states are on the same device
         sb = state_backstory.to(self.device)
         sn = state_novel.to(self.device)
-
+        
+        # Calculate L2 Norm of difference
         distance = torch.norm(sb - sn)
         return float(distance.item())
 
-    def compute_loss(self, text: str) -> float:
-        """Compute language modeling loss (surprisal) for given text.
-
-        This method runs the model on the text and returns the CrossEntropyLoss
-        (Language Modeling loss), which provides a direct 'Surprisal' score.
-        Higher loss indicates the model finds the text more surprising/unexpected.
-
-        Args:
-            text: Input text to compute loss for.
-
-        Returns:
-            The language modeling loss as a Python float (surprisal score).
-        """
-        self.model.eval()
-        tokenizer = self.tokenizer
-
-        # Tokenize text
-        tokens = tokenizer.encode(text)
-        chunk_size = self.inference_config.chunk_size
-
-        # Split into chunks if needed
-        if len(tokens) > chunk_size:
-            token_chunks = tokenizer.chunk_text(text, chunk_size)
-        else:
-            token_chunks = [tokens]
-
-        total_loss = 0.0
-        total_tokens = 0
-
-        # Use the (trained) LM head stored in self.lm_head
-        criterion = torch.nn.CrossEntropyLoss(ignore_index=0)
-
+    # --- Internal Logic for BDH (Recurrent ρ-Matrix) ---
+    def _compute_bdh_state(self, token_chunks: list[list[int]]) -> Tensor:
+        """Accumulate ρ-matrix across chunks sequentially."""
+        state = self.model.reset_state()
+        
         with torch.no_grad():
             for chunk in token_chunks:
-                if not chunk:
-                    continue
-
-                # Prepare input
-                if len(chunk) > chunk_size:
-                    chunk = chunk[:chunk_size]
-                else:
-                    chunk = chunk + [0] * (chunk_size - len(chunk))
-
+                if not chunk: continue
+                
                 input_ids = torch.tensor([chunk], dtype=torch.long, device=self.device)
-                attention_mask = (input_ids != 0).long().to(self.device)
-                labels = input_ids.clone()
+                
+                # Forward pass updating state
+                # Returns: logits, state, rho_update
+                _, state, _ = self.model(
+                    idx=input_ids, 
+                    state=state, 
+                    return_state=True
+                )
+                
+                # Detach to prevent graph buildup
+                if state: 
+                    state = state.detach()
+        
+        # Return flattened ρ-matrix or zero vector
+        if state and state.rho_matrix is not None:
+            return state.rho_matrix.squeeze(0).cpu()
+        else:
+            # Calculate dimension: N * nh * D
+            # We access internal config to calculate correct zero vector size
+            multiplier = getattr(self.model_config, 'mlp_internal_dim_multiplier', 4)
+            N = multiplier * self.model_config.n_embd // self.model_config.n_head
+            dim = self.model_config.n_head * N * self.model_config.n_embd
+            return torch.zeros(dim, device="cpu")
 
+    # --- Internal Logic for GPT-2 (Hidden State Averaging) ---
+    def _compute_gpt2_state(self, token_chunks: list[list[int]]) -> Tensor:
+        """Compute average of last hidden states across all chunks."""
+        hidden_means = []
+        
+        with torch.no_grad():
+            for chunk in token_chunks:
+                if not chunk: continue
+                
+                input_ids = torch.tensor(chunk, dtype=torch.long, device=self.device).unsqueeze(0)
+                attention_mask = torch.ones_like(input_ids)
+                
                 # Forward pass
                 outputs = self.model.gpt(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    output_hidden_states=True
                 )
-                hidden_states = outputs.last_hidden_state  # (1, T, H)
+                
+                # Get last hidden state: [1, seq_len, n_embd]
+                last_hidden = outputs.last_hidden_state
+                
+                # Average over sequence length: [n_embd]
+                chunk_mean = last_hidden.mean(dim=1).squeeze(0)
+                hidden_means.append(chunk_mean)
+        
+        if not hidden_means:
+            return torch.zeros(self.model_config.n_embd, device="cpu")
+        
+        # Average over all chunks
+        final_state = torch.stack(hidden_means).mean(dim=0).cpu()
+        return final_state
 
-                # Apply LM head (use stored trained head)
-                logits = self.lm_head(hidden_states)  # (1, T, vocab_size)
+    def compute_loss(self, text: str) -> float:
+        """Compute language modeling loss (surprisal) for given text.
+        
+        Adapts to the input requirements of the specific architecture.
+        """
+        self.model.eval()
+        tokens = self.tokenizer.encode(text)
+        chunk_size = self.inference_config.chunk_size
+        
+        # Split into chunks
+        if len(tokens) > chunk_size:
+            token_chunks = self.tokenizer.chunk_text(text, chunk_size)
+        else:
+            token_chunks = [tokens] if tokens else []
+        
+        total_loss = 0.0
+        total_tokens = 0
+        criterion = nn.CrossEntropyLoss(ignore_index=0)
+        
+        # BDH needs state tracking across chunks
+        state = self.model.reset_state() if self.model_config.model_type == "bdh" else None
 
-                # Compute loss
-                logits_flat = logits.view(-1, logits.size(-1))
-                labels_flat = labels.view(-1)
-                loss = criterion(logits_flat, labels_flat)
+        with torch.no_grad():
+            for chunk in token_chunks:
+                if not chunk: continue
+                
+                # Prepare inputs
+                input_ids = torch.tensor([chunk], dtype=torch.long, device=self.device)
+                labels = input_ids.clone()
+                
+                logits = None
 
-                # Accumulate (weighted by number of non-padding tokens)
-                num_tokens = attention_mask.sum().item()
+                if self.model_config.model_type == "bdh":
+                    # BDH Forward
+                    logits, state, _ = self.model(
+                        idx=input_ids, 
+                        state=state, 
+                        return_state=True
+                    )
+                else:
+                    # GPT-2 Forward
+                    # We need explicit attention mask for GPT-2
+                    attention_mask = (input_ids != 0).long()
+                    outputs = self.model.gpt(
+                        input_ids=input_ids, 
+                        attention_mask=attention_mask
+                    )
+                    
+                    # Project hidden states to vocab if we have a head
+                    if self.lm_head is not None:
+                        logits = self.lm_head(outputs.last_hidden_state)
+                    else:
+                        # Cannot compute LM loss without a head
+                        return 0.0
+
+                # Shift logits and labels for Causal LM loss
+                # logits[..., :-1, :] predicts labels[..., 1:]
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                
+                loss = criterion(
+                    shift_logits.view(-1, shift_logits.size(-1)), 
+                    shift_labels.view(-1)
+                )
+                
+                # Accumulate weighted by token count
+                num_tokens = shift_labels.ne(0).sum().item()
                 if num_tokens > 0:
                     total_loss += loss.item() * num_tokens
                     total_tokens += num_tokens
 
-        # Return average loss per token
-        avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
-        return float(avg_loss)
+        return total_loss / total_tokens if total_tokens > 0 else 0.0

@@ -1,6 +1,6 @@
-"""Inference package providing prediction and serving utilities for Mini-GPT2."""
+"""Inference package providing prediction and serving utilities."""
 
 # Inference module
-from .predictor import MiniGPT2Wrapper
+from .predictor import NarrativePredictor
 
-__all__ = ["MiniGPT2Wrapper"]
+__all__ = ["NarrativePredictor"]

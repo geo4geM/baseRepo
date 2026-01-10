@@ -1,4 +1,4 @@
-"""Configuration definitions for Mini-GPT2 and BDH model architectures."""
+"""Configuration definitions for Recurrent BDH architecture."""
 
 from __future__ import annotations
 
@@ -10,22 +10,30 @@ import torch
 
 @dataclass
 class ModelConfig:
-    """Configuration for Mini-GPT2-style and BDH models (~30M parameters).
+    """Configuration for Recurrent BDH and Mini-GPT2 models (~30M parameters).
 
     This dataclass encapsulates the architectural hyperparameters for the
-    Mini-GPT2-style Transformer and compatible baseline BDH models. With the
-    default settings, the resulting Transformer has approximately 30 million
-    trainable parameters, suitable for lightweight experimentation and
-    deployment.
+    models. With the default settings, the resulting model has approximately
+    30 million trainable parameters, suitable for lightweight experimentation
+    and deployment.
 
     Attributes:
+        model_type: Architecture to use ("bdh" or "minigpt2").
         vocab_size: Size of the token vocabulary.
         n_embd: Dimensionality of token embeddings and hidden states.
-        n_layer: Number of Transformer blocks.
+        n_layer: Number of layers (blocks).
         n_head: Number of attention heads per block.
         max_seq_len: Maximum supported sequence length.
         num_classes: Number of output classes for classification.
+        mlp_internal_dim_multiplier: Multiplier for the internal dimension (N)
+            relative to the embedding dimension.
+        dropout: Dropout probability.
+        tokenizer_type: Type of tokenizer to use ("byte" or "bpe").
     """
+
+    # --- MODEL SWITCH ---
+    model_type: str = "bdh"  # Options: "bdh", "minigpt2"
+    # --------------------
 
     vocab_size: int = 5000
     n_embd: int = 704
@@ -33,13 +41,12 @@ class ModelConfig:
     n_head: int = 11
     max_seq_len: int = 1024
     num_classes: int = 2
+    
+    # BDH specific parameters
+    mlp_internal_dim_multiplier: int = 4
+    dropout: float = 0.1
 
-    # --- Add this field below (for tokenizer control) ---
     tokenizer_type: str = "bpe"  # "byte" or "bpe"
-    # For advanced usage, you might also add paths for BPE vocab/merges if needed:
-    # bpe_vocab_path: Optional[str] = None
-    # bpe_merges_path: Optional[str] = None
-    # bpe_training_files: Optional[List[str]] = None
 
     @classmethod
     def from_dict(cls, config_dict: Mapping[str, Any]) -> "ModelConfig":
@@ -115,4 +122,3 @@ def get_config_by_name(name: str) -> ModelConfig:
     """
     _ = name
     return ModelConfig()
-
