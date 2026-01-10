@@ -106,6 +106,12 @@ class NarrativePredictor:
             print(f"Loading book from: {path}")
 
         text = path.read_text(encoding="utf-8", errors="replace")
+        
+        # Gemini doesn't need tokenization - handle it first
+        if self.model_config.model_type == "gemini":
+            return self._compute_gemini_state(text)
+        
+        # For other models, tokenize the text
         chunk_size = self.inference_config.chunk_size
         token_chunks = self.tokenizer.chunk_text(text, chunk_size)
 
@@ -114,8 +120,6 @@ class NarrativePredictor:
 
         if self.model_config.model_type == "bdh":
             return self._compute_bdh_state(token_chunks)
-        elif self.model_config.model_type == "gemini":
-            return self._compute_gemini_state(text)
         else:
             return self._compute_gpt2_state(token_chunks)
 
@@ -241,6 +245,10 @@ class NarrativePredictor:
         
         Adapts to the input requirements of the specific architecture.
         """
+        # Gemini doesn't support loss computation (API-based)
+        if self.model_config.model_type == "gemini":
+            return 0.0
+        
         self.model.eval()
         tokens = self.tokenizer.encode(text)
         chunk_size = self.inference_config.chunk_size
@@ -250,10 +258,6 @@ class NarrativePredictor:
             token_chunks = self.tokenizer.chunk_text(text, chunk_size)
         else:
             token_chunks = [tokens] if tokens else []
-        
-        # Gemini doesn't support loss computation (API-based)
-        if self.model_config.model_type == "gemini":
-            return 0.0
         
         total_loss = 0.0
         total_tokens = 0
