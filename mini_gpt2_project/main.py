@@ -15,6 +15,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Fix for tokenizer parallelism warning
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import pandas as pd
 import numpy as np
 import torch
@@ -145,7 +148,7 @@ def train_on_books(
     device: torch.device,
     paths: Dict[str, Path],
     max_steps: int = 1000,
-    batch_size: int = 24,
+    batch_size: int = 4,  # Reduced from 24 to 4 to prevent OOM
 ) -> Tuple[Path, Optional[nn.Module]]:
     """
     Fine-tune model (BDH or GPT-2) on book texts using language modeling objective.
@@ -153,6 +156,10 @@ def train_on_books(
     """
     print(f"\n{'='*60}\nPHASE 0: FINE-TUNING {model_config.model_type.upper()} ON BOOKS\n{'='*60}")
     
+    # Clear GPU cache before starting
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # 1. Gather all book paths for tokenizer training
     book_paths = [str(loader.get_book_path(name)) for name in loader.book_mapping.keys()]
     
@@ -474,7 +481,7 @@ def main():
             device=device,
             paths=paths,
             max_steps=1000,
-            batch_size=24,
+            batch_size=4, # Reduced size for stability
         )
 
     # Create wrapper with the trained/loaded model
