@@ -147,7 +147,7 @@ def train_on_books(
     model_config: ModelConfig,
     device: torch.device,
     paths: Dict[str, Path],
-    max_steps: int = 1000,
+    max_steps: int = 4000,
     batch_size: int = 4,  # Reduced from 24 to 4 to prevent OOM
 ) -> Tuple[Path, Optional[nn.Module]]:
     """
@@ -480,7 +480,7 @@ def main():
             model_config=model_config,
             device=device,
             paths=paths,
-            max_steps=1000,
+            max_steps=4000,
             batch_size=4, # Reduced size for stability
         )
 
