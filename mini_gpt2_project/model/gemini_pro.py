@@ -39,12 +39,7 @@ class GeminiPro:
             )
         
         # Get API key from parameter, environment variable, or raise error
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "Gemini API key is required. Provide it via api_key parameter "
-                "or set GEMINI_API_KEY environment variable."
-            )
+        self.api_key = "AIzaSyASeLlHmx-IKBnMF9pVazUwPgxAn1lRo5s" 
         
         # Configure the API
         genai.configure(api_key=self.api_key)
