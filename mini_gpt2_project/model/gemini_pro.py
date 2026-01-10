@@ -39,7 +39,7 @@ class GeminiPro:
             )
         
         # Get API key from parameter, environment variable, or raise error
-        self.api_key = "AIzaSyASeLlHmx-IKBnMF9pVazUwPgxAn1lRo5s" 
+        self.api_key = "AIzaSyA6XXb7x1UfUy4aT58mqkva6zI0csbm4iI" 
         
         # Configure the API
         genai.configure(api_key=self.api_key)
