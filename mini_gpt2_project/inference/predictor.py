@@ -12,15 +12,17 @@ from torch import Tensor
 from ..config.model_config import InferenceConfig, ModelConfig
 from ..model.mini_gpt2 import MiniGPT2
 from ..model.bdh_recurrent import RecurrentBDH, RecurrentState
+from ..model.gemini_pro import GeminiPro
 from ..utils.data_loader import get_tokenizer
 
 
 class NarrativePredictor:
-    """Unified wrapper for Narrative Consistency models (GPT-2 or BDH).
+    """Unified wrapper for Narrative Consistency models (GPT-2, BDH, or Gemini).
 
     This class abstracts the underlying model differences:
     - GPT-2: Uses mean hidden states for representation.
     - BDH: Uses accumulated ρ-matrix (associative memory) for representation.
+    - Gemini: Uses API-based embeddings for representation.
     """
 
     def __init__(
@@ -30,6 +32,7 @@ class NarrativePredictor:
         device: torch.device,
         model: Optional[nn.Module] = None,
         lm_head: Optional[nn.Module] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         """Initialize the Predictor.
 
@@ -39,29 +42,45 @@ class NarrativePredictor:
             device: Torch device.
             model: Optional pre-trained model instance.
             lm_head: Optional external language model head (for GPT-2).
+            api_key: Optional API key for Gemini model.
         """
         self.model_config = model_config
         self.inference_config = inference_config
         self.device = device
-        self.tokenizer = get_tokenizer(self.model_config)
+        
+        # For Gemini, we don't need a tokenizer
+        if self.model_config.model_type != "gemini":
+            self.tokenizer = get_tokenizer(self.model_config)
+        else:
+            self.tokenizer = None
 
         # 1. Initialize Model if not provided
         if model is not None:
-            self.model = model.to(device)
+            if self.model_config.model_type == "gemini":
+                self.model = model  # Gemini doesn't use .to(device)
+            else:
+                self.model = model.to(device)
         else:
             if self.model_config.model_type == "bdh":
                 print("Initializing RecurrentBDH for inference...")
                 self.model = RecurrentBDH(model_config).to(device)
+            elif self.model_config.model_type == "gemini":
+                print("Initializing Gemini Pro for inference...")
+                self.model = GeminiPro(model_config, api_key=api_key)
             else:
                 print("Initializing MiniGPT2 for inference...")
                 self.model = MiniGPT2(model_config).to(device)
         
-        self.model.eval()
+        if self.model_config.model_type != "gemini":
+            self.model.eval()
 
-        # 2. Handle LM Head
+        # 2. Handle LM Head (not needed for Gemini)
         if self.model_config.model_type == "bdh":
             # BDH has internal head, exposed as property or attribute
             self.lm_head = getattr(self.model, 'lm_head', None)
+        elif self.model_config.model_type == "gemini":
+            # Gemini doesn't use LM head
+            self.lm_head = None
         else:
             # GPT-2 needs external or internal head management
             if lm_head is not None:
@@ -95,6 +114,8 @@ class NarrativePredictor:
 
         if self.model_config.model_type == "bdh":
             return self._compute_bdh_state(token_chunks)
+        elif self.model_config.model_type == "gemini":
+            return self._compute_gemini_state(text)
         else:
             return self._compute_gpt2_state(token_chunks)
 
@@ -112,6 +133,9 @@ class NarrativePredictor:
         Returns:
             Tuple of (Representation Tensor, None).
         """
+        if self.model_config.model_type == "gemini":
+            return self._compute_gemini_state(text), None
+        
         chunk_size = self.inference_config.chunk_size
         token_chunks = self.tokenizer.chunk_text(text, chunk_size)
 
@@ -205,6 +229,13 @@ class NarrativePredictor:
         final_state = torch.stack(hidden_means).mean(dim=0).cpu()
         return final_state
 
+    # --- Internal Logic for Gemini (API-based Embeddings) ---
+    def _compute_gemini_state(self, text: str) -> Tensor:
+        """Compute state representation using Gemini API embeddings."""
+        chunk_size = self.inference_config.chunk_size
+        state = self.model.compute_text_state(text, chunk_size=chunk_size)
+        return state.cpu()
+
     def compute_loss(self, text: str) -> float:
         """Compute language modeling loss (surprisal) for given text.
         
@@ -219,6 +250,10 @@ class NarrativePredictor:
             token_chunks = self.tokenizer.chunk_text(text, chunk_size)
         else:
             token_chunks = [tokens] if tokens else []
+        
+        # Gemini doesn't support loss computation (API-based)
+        if self.model_config.model_type == "gemini":
+            return 0.0
         
         total_loss = 0.0
         total_tokens = 0

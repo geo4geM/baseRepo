@@ -46,6 +46,7 @@ from .utils.data_loader import DataLoader, ByteTokenizer, get_dataset_stats
 from .inference.predictor import NarrativePredictor  # Unified Wrapper
 from .model.bdh_recurrent import RecurrentBDH, RecurrentState
 from .model.mini_gpt2 import MiniGPT2
+from .model.gemini_pro import GeminiPro
 # ---------------------------------------
 
 def parse_args():
@@ -69,6 +70,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint")
     parser.add_argument("--output-dir", type=str, default="outputs", help="Output directory")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--api-key", type=str, default=None, help="API key for Gemini model (or set GEMINI_API_KEY env var)")
     
     return parser.parse_args()
 
@@ -461,16 +463,22 @@ def main():
     if model_config.model_type == "bdh":
         print("Initializing Recurrent BDH...")
         model = RecurrentBDH(model_config).to(device)
+    elif model_config.model_type == "gemini":
+        print("Initializing Gemini Pro...")
+        api_key = args.api_key or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            print("WARNING: No API key provided. Please set GEMINI_API_KEY environment variable or use --api-key argument.")
+        model = GeminiPro(model_config, api_key=api_key)
     else:
         print("Initializing MiniGPT2...")
         model = MiniGPT2(model_config).to(device)
     
-    # Check if we should load a pretrained model
+    # Check if we should load a pretrained model (skip for Gemini)
     model_checkpoint = args.checkpoint
-    if model_checkpoint and Path(model_checkpoint).exists() and model_checkpoint.endswith('.pt'):
+    if model_config.model_type != "gemini" and model_checkpoint and Path(model_checkpoint).exists() and model_checkpoint.endswith('.pt'):
         print(f"Loading pretrained model from {model_checkpoint}")
         load_model_checkpoint(model, None, None, Path(model_checkpoint), device)
-    else:
+    elif model_config.model_type != "gemini":
         print("\n" + "="*60)
         print("TRAINING PHASE: Fine-tuning Model on book texts")
         print("="*60)
@@ -483,18 +491,24 @@ def main():
             max_steps=4000,
             batch_size=4, # Reduced size for stability
         )
+    else:
+        print("\n" + "="*60)
+        print("NOTE: Gemini Pro is API-based and doesn't require training.")
+        print("="*60)
 
     # Create wrapper with the trained/loaded model
-    wrapper = NarrativePredictor(model_config, inference_config, device, model=model, lm_head=None)
+    api_key = args.api_key or os.getenv("GEMINI_API_KEY") if model_config.model_type == "gemini" else None
+    wrapper = NarrativePredictor(model_config, inference_config, device, model=model, lm_head=None, api_key=api_key)
     
-    # Evaluate on train.csv
-    evaluate_on_train_csv(
-        model=model,
-        loader=loader,
-        model_config=model_config,
-        device=device,
-        paths=paths,
-    )
+    # Evaluate on train.csv (skip for Gemini as it's API-based)
+    if model_config.model_type != "gemini":
+        evaluate_on_train_csv(
+            model=model,
+            loader=loader,
+            model_config=model_config,
+            device=device,
+            paths=paths,
+        )
     
     run_train = not args.inference
     run_infer = not args.train
