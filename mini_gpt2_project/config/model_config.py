@@ -32,7 +32,7 @@ class ModelConfig:
     """
 
     # --- MODEL SWITCH ---
-    model_type: str = "gemini"  # Options: "bdh", "minigpt2", "gemini", "gemma"
+    model_type: str = "gemma"  # Options: "bdh", "minigpt2", "gemini", "gemma"
     # --------------------
 
     vocab_size: int = 5000
