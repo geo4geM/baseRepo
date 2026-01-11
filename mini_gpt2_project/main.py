@@ -48,6 +48,7 @@ from .model.bdh_recurrent import RecurrentBDH, RecurrentState
 from .model.mini_gpt2 import MiniGPT2
 from .model.gemini_pro import GeminiPro
 from .model.gemma_model import GemmaModel
+import numpy as np
 # ---------------------------------------
 
 def parse_args():
@@ -275,6 +276,98 @@ def train_on_books(
 
     return final_checkpoint_path, None
 
+def train_gemma_on_books(
+    model: GemmaModel,
+    loader: DataLoader,
+    model_config: ModelConfig,
+    paths: Dict[str, Path],
+    max_iterations: int = 200,
+) -> Dict[str, Tensor]:
+    """
+    "Train" Gemma model by processing books through API multiple times.
+    Since Gemma is API-based, we can't train weights, but we can refine
+    state representations by processing books iteratively.
+    
+    Args:
+        model: GemmaModel instance
+        loader: DataLoader with book paths
+        model_config: Model configuration
+        paths: Path dictionary for outputs
+        max_iterations: Number of iterations to process books
+        
+    Returns:
+        Dictionary mapping book names to refined state tensors
+    """
+    print(f"\n{'='*60}\nPHASE 0: PROCESSING BOOKS THROUGH GEMMA API ({max_iterations} ITERATIONS)\n{'='*60}")
+    
+    # Load all books
+    book_texts = {}
+    for book_name in loader.book_mapping.keys():
+        book_path = loader.get_book_path(book_name)
+        print(f"Loading: {book_name}")
+        with open(book_path, 'r', encoding='utf-8', errors='replace') as f:
+            book_texts[book_name] = f.read()
+        print(f"  Loaded {len(book_texts[book_name])} characters")
+    
+    # Process each book through Gemma API for multiple iterations
+    refined_states = {}
+    chunk_size = 1024  # Character chunk size for processing
+    
+    for book_name, text in book_texts.items():
+        print(f"\nProcessing {book_name} through Gemma API ({max_iterations} iterations)...")
+        
+        # Accumulate embeddings over iterations
+        all_embeddings = []
+        
+        pbar = tqdm(total=max_iterations, desc=f"Processing {book_name[:30]}...", unit="iter")
+        
+        for iteration in range(max_iterations):
+            # Process book in chunks and get embeddings
+            chunks = []
+            for i in range(0, len(text), chunk_size):
+                chunk = text[i:i + chunk_size]
+                if chunk.strip():
+                    chunks.append(chunk)
+            
+            # Get embeddings for all chunks in this iteration
+            iteration_embeddings = []
+            for chunk in chunks:
+                try:
+                    embedding = model.get_embedding(chunk)
+                    iteration_embeddings.append(embedding)
+                except Exception as e:
+                    print(f"  Warning: Error getting embedding on iteration {iteration}: {e}")
+                    continue
+            
+            if iteration_embeddings:
+                # Average embeddings for this iteration
+                iteration_mean = np.mean(iteration_embeddings, axis=0)
+                all_embeddings.append(iteration_mean)
+            
+            pbar.update(1)
+            pbar.set_postfix({"embeddings": len(all_embeddings)})
+        
+        pbar.close()
+        
+        # Final refined state: average over all iterations
+        if all_embeddings:
+            final_state = np.mean(all_embeddings, axis=0)
+            refined_states[book_name] = torch.from_numpy(final_state).float()
+            print(f"  ✓ Refined state computed: {refined_states[book_name].shape}")
+        else:
+            # Fallback: use single pass if iterations failed
+            print(f"  ⚠ Using single-pass fallback for {book_name}")
+            state = model.compute_text_state(text, chunk_size=chunk_size)
+            refined_states[book_name] = state
+    
+    # Save refined states
+    states_path = paths["checkpoints"] / "gemma_refined_states.pkl"
+    with open(states_path, 'wb') as f:
+        pickle.dump(refined_states, f)
+    print(f"\n✓ Saved refined states to {states_path}")
+    
+    return refined_states
+
 def save_model_checkpoint(
     model: nn.Module,
     lm_head: Optional[nn.Module],
@@ -429,12 +522,22 @@ def evaluate_api_model_on_train_csv(
     print(f"✓ Saved evaluation results to {paths['output']}/train_evaluation.csv")
     return accuracy
 
-def precompute_novel_states(wrapper: NarrativePredictor, loader: DataLoader, paths: Dict[str, Path]) -> Dict[str, any]:
+def precompute_novel_states(wrapper: NarrativePredictor, loader: DataLoader, paths: Dict[str, Path], model_config: ModelConfig) -> Dict[str, any]:
     cache_path = paths["checkpoints"] / "novel_states.pkl"
+    
+    # For Gemma, check if we have refined states from training
+    if model_config.model_type == "gemma":
+        refined_states_path = paths["checkpoints"] / "gemma_refined_states.pkl"
+        if refined_states_path.exists():
+            print(f"\n✓ Loading refined Gemma states from {refined_states_path}")
+            with open(refined_states_path, 'rb') as f:
+                return pickle.load(f)
+    
     if cache_path.exists():
         print(f"\n✓ Loading cached novel states from {cache_path}")
         with open(cache_path, 'rb') as f:
             return pickle.load(f)
+    
     print("\n" + "="*60 + "\nPHASE 0: PRE-COMPUTING NOVEL STATES\n" + "="*60)
     novel_states = {}
     for book_name in loader.book_mapping.keys():
@@ -542,7 +645,28 @@ def main():
     if model_config.model_type not in ["gemini", "gemma"] and model_checkpoint and Path(model_checkpoint).exists() and model_checkpoint.endswith('.pt'):
         print(f"Loading pretrained model from {model_checkpoint}")
         load_model_checkpoint(model, None, None, Path(model_checkpoint), device)
-    elif model_config.model_type not in ["gemini", "gemma"]:
+    elif model_config.model_type == "gemma":
+        # Check if refined states already exist
+        refined_states_path = paths["checkpoints"] / "gemma_refined_states.pkl"
+        if refined_states_path.exists() and args.inference:
+            print("\n" + "="*60)
+            print("NOTE: Using existing refined Gemma states from previous training.")
+            print("="*60)
+        else:
+            print("\n" + "="*60)
+            print("TRAINING PHASE: Processing Books Through Gemma API (200 iterations)")
+            print("="*60)
+            # For Gemma, we process books through API to refine representations
+            refined_states = train_gemma_on_books(
+                model=model,
+                loader=loader,
+                model_config=model_config,
+                paths=paths,
+                max_iterations=200,
+            )
+            # Store refined states for later use
+            model.refined_states = refined_states
+    elif model_config.model_type not in ["gemini"]:
         print("\n" + "="*60)
         print("TRAINING PHASE: Fine-tuning Model on book texts")
         print("="*60)
@@ -590,7 +714,7 @@ def main():
     run_train = not args.inference
     run_infer = not args.train
     
-    novel_states = precompute_novel_states(wrapper, loader, paths)
+    novel_states = precompute_novel_states(wrapper, loader, paths, model_config)
     calibration = None
     
     if run_train:
