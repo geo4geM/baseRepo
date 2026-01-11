@@ -47,6 +47,7 @@ from .inference.predictor import NarrativePredictor  # Unified Wrapper
 from .model.bdh_recurrent import RecurrentBDH, RecurrentState
 from .model.mini_gpt2 import MiniGPT2
 from .model.gemini_pro import GeminiPro
+from .model.gemma_model import GemmaModel
 # ---------------------------------------
 
 def parse_args():
@@ -371,6 +372,63 @@ def evaluate_on_train_csv(
     print(f"✓ Saved evaluation results to {paths['output']}/train_evaluation.csv")
     return accuracy
 
+def evaluate_api_model_on_train_csv(
+    wrapper: NarrativePredictor,
+    loader: DataLoader,
+    model_config: ModelConfig,
+    paths: Dict[str, Path],
+) -> float:
+    """Evaluate API-based model (Gemini/Gemma) on train.csv using velocity-based approach."""
+    print("\n" + "="*60 + "\nEVALUATING API MODEL ON TRAIN.CSV\n" + "="*60)
+    train_examples = loader.get_train_examples()
+    predictions = []
+    true_labels = []
+    velocities = []
+    print(f"Evaluating on {len(train_examples)} examples...")
+    
+    # Pre-compute novel states for all books
+    novel_states = {}
+    for book_name in loader.book_mapping.keys():
+        book_path = loader.get_book_path(book_name)
+        novel_state = wrapper.compute_novel_state(book_path, verbose=False)
+        novel_states[book_name] = novel_state
+    
+    for example in tqdm(train_examples, desc="Evaluating"):
+        try:
+            book_name = example['book_name']
+            novel_state = novel_states.get(book_name)
+            
+            if novel_state is None:
+                prediction = 1  # Default to consistent
+                velocity = 0.0
+            else:
+                backstory_state, _ = wrapper.prime_with_backstory(example['content'])
+                velocity = wrapper.compute_velocity_from_states(backstory_state, novel_state)
+                velocities.append(velocity)
+                
+                # Simple threshold-based prediction (you can use calibration later)
+                # For now, use a simple heuristic: lower velocity = more consistent
+                threshold = np.median(velocities) if velocities else 1.0
+                prediction = 1 if velocity < threshold else 0
+            
+            predictions.append(prediction)
+            true_labels.append(example['label_binary'])
+        except Exception as e:
+            print(f"Error on example {example['id']}: {e}")
+            predictions.append(1)  # Default to consistent
+            true_labels.append(example['label_binary'])
+    
+    accuracy = accuracy_score(true_labels, predictions)
+    print(f"\n✓ Accuracy on train.csv: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    results_df = pd.DataFrame({
+        "id": [ex['id'] for ex in train_examples],
+        "true_label": true_labels,
+        "predicted_label": predictions,
+    })
+    results_df.to_csv(paths["output"] / "train_evaluation.csv", index=False)
+    print(f"✓ Saved evaluation results to {paths['output']}/train_evaluation.csv")
+    return accuracy
+
 def precompute_novel_states(wrapper: NarrativePredictor, loader: DataLoader, paths: Dict[str, Path]) -> Dict[str, any]:
     cache_path = paths["checkpoints"] / "novel_states.pkl"
     if cache_path.exists():
@@ -469,16 +527,22 @@ def main():
         if not api_key:
             print("WARNING: No API key provided. Please set GEMINI_API_KEY environment variable or use --api-key argument.")
         model = GeminiPro(model_config, api_key=api_key)
+    elif model_config.model_type == "gemma":
+        print("Initializing Gemma Model...")
+        api_key = args.api_key or os.getenv("HUGGINGFACE_API_KEY")
+        if not api_key:
+            print("NOTE: No Hugging Face API key provided. Using public API (may have rate limits).")
+        model = GemmaModel(model_config, api_key=api_key)
     else:
         print("Initializing MiniGPT2...")
         model = MiniGPT2(model_config).to(device)
     
-    # Check if we should load a pretrained model (skip for Gemini)
+    # Check if we should load a pretrained model (skip for Gemini/Gemma)
     model_checkpoint = args.checkpoint
-    if model_config.model_type != "gemini" and model_checkpoint and Path(model_checkpoint).exists() and model_checkpoint.endswith('.pt'):
+    if model_config.model_type not in ["gemini", "gemma"] and model_checkpoint and Path(model_checkpoint).exists() and model_checkpoint.endswith('.pt'):
         print(f"Loading pretrained model from {model_checkpoint}")
         load_model_checkpoint(model, None, None, Path(model_checkpoint), device)
-    elif model_config.model_type != "gemini":
+    elif model_config.model_type not in ["gemini", "gemma"]:
         print("\n" + "="*60)
         print("TRAINING PHASE: Fine-tuning Model on book texts")
         print("="*60)
@@ -493,15 +557,28 @@ def main():
         )
     else:
         print("\n" + "="*60)
-        print("NOTE: Gemini Pro is API-based and doesn't require training.")
+        print(f"NOTE: {model_config.model_type.upper()} is API-based and doesn't require training.")
         print("="*60)
 
     # Create wrapper with the trained/loaded model
-    api_key = args.api_key or os.getenv("GEMINI_API_KEY") if model_config.model_type == "gemini" else None
+    if model_config.model_type == "gemini":
+        api_key = args.api_key or os.getenv("GEMINI_API_KEY")
+    elif model_config.model_type == "gemma":
+        api_key = args.api_key or os.getenv("HUGGINGFACE_API_KEY")
+    else:
+        api_key = None
     wrapper = NarrativePredictor(model_config, inference_config, device, model=model, lm_head=None, api_key=api_key)
     
-    # Evaluate on train.csv (skip for Gemini as it's API-based)
-    if model_config.model_type != "gemini":
+    # Evaluate on train.csv
+    # For API-based models (Gemini/Gemma), use wrapper-based evaluation
+    if model_config.model_type in ["gemini", "gemma"]:
+        evaluate_api_model_on_train_csv(
+            wrapper=wrapper,
+            loader=loader,
+            model_config=model_config,
+            paths=paths,
+        )
+    else:
         evaluate_on_train_csv(
             model=model,
             loader=loader,

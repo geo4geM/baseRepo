@@ -18,7 +18,7 @@ class ModelConfig:
     and deployment.
 
     Attributes:
-        model_type: Architecture to use ("bdh", "minigpt2", or "gemini").
+        model_type: Architecture to use ("bdh", "minigpt2", "gemini", or "gemma").
         vocab_size: Size of the token vocabulary.
         n_embd: Dimensionality of token embeddings and hidden states.
         n_layer: Number of layers (blocks).
@@ -32,7 +32,7 @@ class ModelConfig:
     """
 
     # --- MODEL SWITCH ---
-    model_type: str = "gemini"  # Options: "bdh", "minigpt2", "gemini"
+    model_type: str = "gemini"  # Options: "bdh", "minigpt2", "gemini", "gemma"
     # --------------------
 
     vocab_size: int = 5000

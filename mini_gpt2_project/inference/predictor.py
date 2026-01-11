@@ -13,16 +13,18 @@ from ..config.model_config import InferenceConfig, ModelConfig
 from ..model.mini_gpt2 import MiniGPT2
 from ..model.bdh_recurrent import RecurrentBDH, RecurrentState
 from ..model.gemini_pro import GeminiPro
+from ..model.gemma_model import GemmaModel
 from ..utils.data_loader import get_tokenizer
 
 
 class NarrativePredictor:
-    """Unified wrapper for Narrative Consistency models (GPT-2, BDH, or Gemini).
+    """Unified wrapper for Narrative Consistency models (GPT-2, BDH, Gemini, or Gemma).
 
     This class abstracts the underlying model differences:
     - GPT-2: Uses mean hidden states for representation.
     - BDH: Uses accumulated ρ-matrix (associative memory) for representation.
     - Gemini: Uses API-based embeddings for representation.
+    - Gemma: Uses Hugging Face API-based embeddings for representation.
     """
 
     def __init__(
@@ -48,16 +50,16 @@ class NarrativePredictor:
         self.inference_config = inference_config
         self.device = device
         
-        # For Gemini, we don't need a tokenizer
-        if self.model_config.model_type != "gemini":
+        # For Gemini and Gemma, we don't need a tokenizer
+        if self.model_config.model_type not in ["gemini", "gemma"]:
             self.tokenizer = get_tokenizer(self.model_config)
         else:
             self.tokenizer = None
 
         # 1. Initialize Model if not provided
         if model is not None:
-            if self.model_config.model_type == "gemini":
-                self.model = model  # Gemini doesn't use .to(device)
+            if self.model_config.model_type in ["gemini", "gemma"]:
+                self.model = model  # API models don't use .to(device)
             else:
                 self.model = model.to(device)
         else:
@@ -67,19 +69,22 @@ class NarrativePredictor:
             elif self.model_config.model_type == "gemini":
                 print("Initializing Gemini Pro for inference...")
                 self.model = GeminiPro(model_config, api_key=api_key)
+            elif self.model_config.model_type == "gemma":
+                print("Initializing Gemma Model for inference...")
+                self.model = GemmaModel(model_config, api_key=api_key)
             else:
                 print("Initializing MiniGPT2 for inference...")
                 self.model = MiniGPT2(model_config).to(device)
         
-        if self.model_config.model_type != "gemini":
+        if self.model_config.model_type not in ["gemini", "gemma"]:
             self.model.eval()
 
-        # 2. Handle LM Head (not needed for Gemini)
+        # 2. Handle LM Head (not needed for Gemini/Gemma)
         if self.model_config.model_type == "bdh":
             # BDH has internal head, exposed as property or attribute
             self.lm_head = getattr(self.model, 'lm_head', None)
-        elif self.model_config.model_type == "gemini":
-            # Gemini doesn't use LM head
+        elif self.model_config.model_type in ["gemini", "gemma"]:
+            # API models don't use LM head
             self.lm_head = None
         else:
             # GPT-2 needs external or internal head management
@@ -107,9 +112,11 @@ class NarrativePredictor:
 
         text = path.read_text(encoding="utf-8", errors="replace")
         
-        # Gemini doesn't need tokenization - handle it first
+        # Gemini and Gemma don't need tokenization - handle them first
         if self.model_config.model_type == "gemini":
             return self._compute_gemini_state(text)
+        elif self.model_config.model_type == "gemma":
+            return self._compute_gemma_state(text)
         
         # For other models, tokenize the text
         chunk_size = self.inference_config.chunk_size
@@ -139,6 +146,8 @@ class NarrativePredictor:
         """
         if self.model_config.model_type == "gemini":
             return self._compute_gemini_state(text), None
+        elif self.model_config.model_type == "gemma":
+            return self._compute_gemma_state(text), None
         
         chunk_size = self.inference_config.chunk_size
         token_chunks = self.tokenizer.chunk_text(text, chunk_size)
@@ -239,14 +248,21 @@ class NarrativePredictor:
         chunk_size = self.inference_config.chunk_size
         state = self.model.compute_text_state(text, chunk_size=chunk_size)
         return state.cpu()
+    
+    # --- Internal Logic for Gemma (API-based Embeddings) ---
+    def _compute_gemma_state(self, text: str) -> Tensor:
+        """Compute state representation using Gemma API embeddings."""
+        chunk_size = self.inference_config.chunk_size
+        state = self.model.compute_text_state(text, chunk_size=chunk_size)
+        return state.cpu()
 
     def compute_loss(self, text: str) -> float:
         """Compute language modeling loss (surprisal) for given text.
         
         Adapts to the input requirements of the specific architecture.
         """
-        # Gemini doesn't support loss computation (API-based)
-        if self.model_config.model_type == "gemini":
+        # Gemini and Gemma don't support loss computation (API-based)
+        if self.model_config.model_type in ["gemini", "gemma"]:
             return 0.0
         
         self.model.eval()
