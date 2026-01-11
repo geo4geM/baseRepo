@@ -39,7 +39,7 @@ class GemmaModel:
             )
         
         # Get API key directly from here (hardcoded)
-        self.api_key = "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"
+        self.api_key = api_key or os.getenv("HUGGINGFACE_API_KEY")
         
         # Initialize Hugging Face client
         self.client = InferenceClient(token=self.api_key)
