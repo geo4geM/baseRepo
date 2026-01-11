@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+from torch import Tensor
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
@@ -48,7 +49,6 @@ from .model.bdh_recurrent import RecurrentBDH, RecurrentState
 from .model.mini_gpt2 import MiniGPT2
 from .model.gemini_pro import GeminiPro
 from .model.gemma_model import GemmaModel
-import numpy as np
 # ---------------------------------------
 
 def parse_args():
